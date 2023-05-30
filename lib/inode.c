@@ -25,6 +25,7 @@
 #include "erofs/block_list.h"
 #include "erofs/compress_hints.h"
 #include "erofs/blobchunk.h"
+#include "erofs/fragments.h"
 #include "liberofs_private.h"
 
 #define S_SHIFT                 12
@@ -41,6 +42,25 @@ static unsigned char erofs_ftype_by_mode[S_IFMT >> S_SHIFT] = {
 unsigned char erofs_mode_to_ftype(umode_t mode)
 {
 	return erofs_ftype_by_mode[(mode & S_IFMT) >> S_SHIFT];
+}
+
+static const unsigned char erofs_dtype_by_ftype[EROFS_FT_MAX] = {
+	[EROFS_FT_UNKNOWN]	= DT_UNKNOWN,
+	[EROFS_FT_REG_FILE]	= DT_REG,
+	[EROFS_FT_DIR]		= DT_DIR,
+	[EROFS_FT_CHRDEV]	= DT_CHR,
+	[EROFS_FT_BLKDEV]	= DT_BLK,
+	[EROFS_FT_FIFO]		= DT_FIFO,
+	[EROFS_FT_SOCK]		= DT_SOCK,
+	[EROFS_FT_SYMLINK]	= DT_LNK
+};
+
+unsigned char erofs_ftype_to_dtype(unsigned int filetype)
+{
+	if (filetype >= EROFS_FT_MAX)
+		return DT_UNKNOWN;
+
+	return erofs_dtype_by_ftype[filetype];
 }
 
 #define NR_INODE_HASHTABLE	16384
@@ -99,6 +119,8 @@ unsigned int erofs_iput(struct erofs_inode *inode)
 	if (inode->eof_tailraw)
 		free(inode->eof_tailraw);
 	list_del(&inode->i_hash);
+	if (inode->i_srcpath)
+		free(inode->i_srcpath);
 	free(inode);
 	return 0;
 }
@@ -386,7 +408,7 @@ static int write_uncompressed_file_from_fd(struct erofs_inode *inode, int fd)
 	return 0;
 }
 
-int erofs_write_file(struct erofs_inode *inode)
+static int erofs_write_file(struct erofs_inode *inode)
 {
 	int ret, fd;
 
@@ -404,8 +426,12 @@ int erofs_write_file(struct erofs_inode *inode)
 		return erofs_blob_write_chunked_file(inode);
 	}
 
-	if (cfg.c_compr_alg_master && erofs_file_is_compressible(inode)) {
-		ret = erofs_write_compressed_file(inode);
+	if (cfg.c_compr_alg[0] && erofs_file_is_compressible(inode)) {
+		fd = open(inode->i_srcpath, O_RDONLY | O_BINARY);
+		if (fd < 0)
+			return -errno;
+		ret = erofs_write_compressed_file(inode, fd);
+		close(fd);
 
 		if (!ret || ret != -ENOSPC)
 			return ret;
@@ -750,6 +776,8 @@ static bool erofs_should_use_inode_extended(struct erofs_inode *inode)
 		return true;
 	if (inode->i_size > UINT_MAX)
 		return true;
+	if (erofs_is_packed_inode(inode))
+		return false;
 	if (inode->i_uid > USHRT_MAX)
 		return true;
 	if (inode->i_gid > USHRT_MAX)
@@ -773,7 +801,7 @@ static u32 erofs_new_encode_dev(dev_t dev)
 
 #ifdef WITH_ANDROID
 int erofs_droid_inode_fsconfig(struct erofs_inode *inode,
-			       struct stat64 *st,
+			       struct stat *st,
 			       const char *path)
 {
 	/* filesystem_config does not preserve file type bits */
@@ -784,6 +812,9 @@ int erofs_droid_inode_fsconfig(struct erofs_inode *inode,
 
 	inode->capabilities = 0;
 	if (!cfg.fs_config_file && !cfg.mount_point)
+		return 0;
+	/* avoid loading special inodes */
+	if (path == EROFS_PACKED_INODE)
 		return 0;
 
 	if (!cfg.mount_point ||
@@ -818,15 +849,14 @@ int erofs_droid_inode_fsconfig(struct erofs_inode *inode,
 }
 #else
 static int erofs_droid_inode_fsconfig(struct erofs_inode *inode,
-				      struct stat64 *st,
+				      struct stat *st,
 				      const char *path)
 {
 	return 0;
 }
 #endif
 
-static int erofs_fill_inode(struct erofs_inode *inode,
-			    struct stat64 *st,
+static int erofs_fill_inode(struct erofs_inode *inode, struct stat *st,
 			    const char *path)
 {
 	int err = erofs_droid_inode_fsconfig(inode, st, path);
@@ -836,6 +866,15 @@ static int erofs_fill_inode(struct erofs_inode *inode,
 	inode->i_mode = st->st_mode;
 	inode->i_uid = cfg.c_uid == -1 ? st->st_uid : cfg.c_uid;
 	inode->i_gid = cfg.c_gid == -1 ? st->st_gid : cfg.c_gid;
+
+	if (inode->i_uid + cfg.c_uid_offset < 0)
+		erofs_err("uid overflow @ %s", path);
+	inode->i_uid += cfg.c_uid_offset;
+
+	if (inode->i_gid + cfg.c_gid_offset < 0)
+		erofs_err("gid overflow @ %s", path);
+	inode->i_gid += cfg.c_gid_offset;
+
 	inode->i_mtime = st->st_mtime;
 	inode->i_mtime_nsec = ST_MTIM_NSEC(st);
 
@@ -868,8 +907,9 @@ static int erofs_fill_inode(struct erofs_inode *inode,
 		return -EINVAL;
 	}
 
-	strncpy(inode->i_srcpath, path, sizeof(inode->i_srcpath) - 1);
-	inode->i_srcpath[sizeof(inode->i_srcpath) - 1] = '\0';
+	inode->i_srcpath = strdup(path);
+	if (!inode->i_srcpath)
+		return -ENOMEM;
 
 	inode->dev = st->st_dev;
 	inode->i_ino[1] = st->st_ino;
@@ -910,7 +950,7 @@ static struct erofs_inode *erofs_new_inode(void)
 /* get the inode from the (source) path */
 static struct erofs_inode *erofs_iget_from_path(const char *path, bool is_src)
 {
-	struct stat64 st;
+	struct stat st;
 	struct erofs_inode *inode;
 	int ret;
 
@@ -918,7 +958,7 @@ static struct erofs_inode *erofs_iget_from_path(const char *path, bool is_src)
 	if (!is_src)
 		return ERR_PTR(-EINVAL);
 
-	ret = lstat64(path, &st);
+	ret = lstat(path, &st);
 	if (ret)
 		return ERR_PTR(-errno);
 
@@ -940,10 +980,9 @@ static struct erofs_inode *erofs_iget_from_path(const char *path, bool is_src)
 
 	ret = erofs_fill_inode(inode, &st, path);
 	if (ret) {
-		free(inode);
+		erofs_iput(inode);
 		return ERR_PTR(ret);
 	}
-
 	return inode;
 }
 
@@ -1045,8 +1084,7 @@ static struct erofs_inode *erofs_mkfs_build_tree(struct erofs_inode *dir)
 		if (!dp)
 			break;
 
-		if (is_dot_dotdot(dp->d_name) ||
-		    !strncmp(dp->d_name, "lost+found", strlen("lost+found")))
+		if (is_dot_dotdot(dp->d_name))
 			continue;
 
 		/* skip if it's a exclude file */
@@ -1151,4 +1189,56 @@ struct erofs_inode *erofs_mkfs_build_tree_from_path(struct erofs_inode *parent,
 		inode->i_parent = inode;	/* rootdir mark */
 
 	return erofs_mkfs_build_tree(inode);
+}
+
+struct erofs_inode *erofs_mkfs_build_special_from_fd(int fd, const char *name)
+{
+	struct stat st;
+	struct erofs_inode *inode;
+	int ret;
+
+	ret = lseek(fd, 0, SEEK_SET);
+	if (ret < 0)
+		return ERR_PTR(-errno);
+
+	ret = fstat(fd, &st);
+	if (ret)
+		return ERR_PTR(-errno);
+
+	inode = erofs_new_inode();
+	if (IS_ERR(inode))
+		return inode;
+
+	if (name == EROFS_PACKED_INODE) {
+		st.st_uid = st.st_gid = 0;
+		st.st_nlink = 0;
+	}
+
+	ret = erofs_fill_inode(inode, &st, name);
+	if (ret) {
+		free(inode);
+		return ERR_PTR(ret);
+	}
+
+	if (name == EROFS_PACKED_INODE) {
+		sbi.packed_nid = EROFS_PACKED_NID_UNALLOCATED;
+		inode->nid = sbi.packed_nid;
+	}
+
+	ret = erofs_write_compressed_file(inode, fd);
+	if (ret == -ENOSPC) {
+		ret = lseek(fd, 0, SEEK_SET);
+		if (ret < 0)
+			return ERR_PTR(-errno);
+
+		ret = write_uncompressed_file_from_fd(inode, fd);
+	}
+
+	if (ret) {
+		DBG_BUGON(ret == -ENOSPC);
+		return ERR_PTR(ret);
+	}
+	erofs_prepare_inode_buffer(inode);
+	erofs_write_tail_end(inode);
+	return inode;
 }
