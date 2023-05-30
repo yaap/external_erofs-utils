@@ -46,14 +46,18 @@ static int erofs_init_devices(struct erofs_sb_info *sbi,
 
 	sbi->device_id_mask = roundup_pow_of_two(ondisk_extradevs + 1) - 1;
 	sbi->devs = calloc(ondisk_extradevs, sizeof(*sbi->devs));
+	if (!sbi->devs)
+		return -ENOMEM;
 	pos = le16_to_cpu(dsb->devt_slotoff) * EROFS_DEVT_SLOT_SIZE;
 	for (i = 0; i < ondisk_extradevs; ++i) {
 		struct erofs_deviceslot dis;
 		int ret;
 
 		ret = dev_read(0, &dis, pos, sizeof(dis));
-		if (ret < 0)
+		if (ret < 0) {
+			free(sbi->devs);
 			return ret;
+		}
 
 		sbi->devs[i].mapped_blkaddr = dis.mapped_blkaddr;
 		sbi->total_blocks += dis.blocks;
@@ -100,6 +104,7 @@ int erofs_read_superblock(void)
 	sbi.xattr_blkaddr = le32_to_cpu(dsb->xattr_blkaddr);
 	sbi.islotbits = EROFS_ISLOTBITS;
 	sbi.root_nid = le16_to_cpu(dsb->root_nid);
+	sbi.packed_nid = le64_to_cpu(dsb->packed_nid);
 	sbi.inos = le64_to_cpu(dsb->inos);
 	sbi.checksum = le32_to_cpu(dsb->checksum);
 
@@ -108,4 +113,10 @@ int erofs_read_superblock(void)
 
 	memcpy(&sbi.uuid, dsb->uuid, sizeof(dsb->uuid));
 	return erofs_init_devices(&sbi, dsb);
+}
+
+void erofs_put_super(void)
+{
+	if (sbi.devs)
+		free(sbi.devs);
 }
