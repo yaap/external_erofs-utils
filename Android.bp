@@ -73,6 +73,7 @@ cc_defaults {
         "-DHAVE_SYS_IOCTL_H",
         "-DHAVE_LLISTXATTR",
         "-DHAVE_LGETXATTR",
+        "-D_FILE_OFFSET_BITS=64",
     ],
 }
 
