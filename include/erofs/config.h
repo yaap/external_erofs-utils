@@ -45,13 +45,16 @@ struct erofs_configure {
 #endif
 	char c_timeinherit;
 	char c_chunkbits;
-	bool c_noinline_data;
+	bool c_inline_data;
 	bool c_ztailpacking;
 	bool c_fragments;
 	bool c_all_fragments;
 	bool c_dedupe;
 	bool c_ignore_mtime;
 	bool c_showprogress;
+	bool c_extra_ea_name_prefixes;
+	bool c_xattr_name_filter;
+	bool c_ovlfs_strip;
 
 #ifdef HAVE_LIBSELINUX
 	struct selabel_handle *sehnd;
