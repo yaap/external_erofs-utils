@@ -109,6 +109,9 @@ cc_library {
     srcs: [
         "lib/*.c",
     ],
+    exclude_srcs: [
+        "lib/compressor_libdeflate.c",
+    ],
     export_include_dirs: ["include"],
 
     target: {
@@ -124,7 +127,6 @@ cc_defaults {
     defaults: ["erofs-utils_defaults"],
 
     srcs: [
-        "lib/*.c",
         "mkfs/*.c",
     ],
     static_libs: [
@@ -159,7 +161,6 @@ cc_binary {
     host_supported: true,
     recovery_available: true,
     srcs: [
-        "lib/*.c",
         "dump/*.c",
     ],
     static_libs: [
@@ -178,7 +179,6 @@ cc_binary {
     host_supported: true,
     recovery_available: true,
     srcs: [
-        "lib/*.c",
         "fsck/*.c",
     ],
     static_libs: [
