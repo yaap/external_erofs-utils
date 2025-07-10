@@ -159,6 +159,12 @@ cc_defaults {
         darwin: {
             enabled: false,
         },
+        // Disabled since it triggers LeakSanitizer. See b/430924853.
+        linux_glibc: {
+            sanitize: {
+                never: true,
+            },
+        },
     },
 }
 
