@@ -170,6 +170,7 @@ static unsigned int put_xattritem(struct xattr_item *item)
 	if (item->count > 1)
 		return --item->count;
 	hash_del(&item->node);
+	free((void *)item->kvbuf);
 	free(item);
 	return 0;
 }
@@ -782,6 +783,7 @@ static void erofs_cleanxattrs(bool sharedxattrs)
 			continue;
 
 		hash_del(&item->node);
+		free((void *)item->kvbuf);
 		free(item);
 	}
 
