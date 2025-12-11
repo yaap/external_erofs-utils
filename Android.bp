@@ -79,6 +79,7 @@ cc_defaults {
         "-DHAVE_UNISTD_H",
         "-DHAVE_SYSCONF",
         "-DEROFS_MT_ENABLED",
+        "-DHAVE_PTHREAD_H",
     ],
 }
 
