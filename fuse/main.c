@@ -12,6 +12,7 @@
 #include "erofs/print.h"
 #include "erofs/dir.h"
 #include "erofs/inode.h"
+#include "erofs/fragments.h"
 
 #include <float.h>
 #include <fuse.h>
@@ -230,7 +231,7 @@ static void erofsfuse_open(fuse_req_t req, fuse_ino_t ino,
 		return;
 	}
 
-	vi = (struct erofs_inode *)malloc(sizeof(struct erofs_inode));
+	vi = calloc(1, sizeof(struct erofs_inode));
 	if (!vi) {
 		fuse_reply_err(req, ENOMEM);
 		return;
@@ -280,7 +281,7 @@ static void erofsfuse_opendir(fuse_req_t req, fuse_ino_t ino,
 	int ret;
 	struct erofs_inode *vi;
 
-	vi = (struct erofs_inode *)malloc(sizeof(struct erofs_inode));
+	vi = calloc(1, sizeof(struct erofs_inode));
 	if (!vi) {
 		fuse_reply_err(req, ENOMEM);
 		return;
@@ -323,7 +324,7 @@ static void erofsfuse_lookup(fuse_req_t req, fuse_ino_t parent,
 	struct fuse_entry_param fentry = { 0 };
 	struct erofsfuse_lookupdir_context ctx = { 0 };
 
-	vi = (struct erofs_inode *)malloc(sizeof(struct erofs_inode));
+	vi = calloc(1, sizeof(struct erofs_inode));
 	if (!vi) {
 		fuse_reply_err(req, ENOMEM);
 		return;
@@ -688,11 +689,20 @@ int main(int argc, char *argv[])
 		goto err_dev_close;
 	}
 
+	if (erofs_sb_has_fragments(&g_sbi) && g_sbi.packed_nid > 0) {
+		ret = erofs_packedfile_init(&g_sbi, false);
+		if (ret) {
+			erofs_err("failed to initialize packedfile: %s",
+				  erofs_strerror(ret));
+			goto err_super_put;
+		}
+	}
+
 #if FUSE_MAJOR_VERSION >= 3
 	se = fuse_session_new(&args, &erofsfuse_lops, sizeof(erofsfuse_lops),
 			      NULL);
 	if (!se)
-		goto err_super_put;
+		goto err_packedinode;
 
 	if (fuse_session_mount(se, opts.mountpoint) >= 0) {
 		EROFSFUSE_MOUNT_MSG
@@ -722,7 +732,7 @@ int main(int argc, char *argv[])
 #else
 	ch = fuse_mount(opts.mountpoint, &args);
 	if (!ch)
-		goto err_super_put;
+		goto err_packedinode;
 	EROFSFUSE_MOUNT_MSG
 	se = fuse_lowlevel_new(&args, &erofsfuse_lops, sizeof(erofsfuse_lops),
 			       NULL);
@@ -743,6 +753,8 @@ int main(int argc, char *argv[])
 	fuse_unmount(opts.mountpoint, ch);
 #endif
 
+err_packedinode:
+	erofs_packedfile_exit(&g_sbi);
 err_super_put:
 	erofs_put_super(&g_sbi);
 err_dev_close:

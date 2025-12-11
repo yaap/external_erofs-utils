@@ -33,6 +33,12 @@ enum {
 	TIMESTAMP_CLAMPING,
 };
 
+enum {
+	FRAGDEDUPE_FULL,
+	FRAGDEDUPE_INODE,
+	FRAGDEDUPE_OFF,
+};
+
 #define EROFS_MAX_COMPR_CFGS		64
 
 struct erofs_compr_opts {
@@ -53,6 +59,7 @@ struct erofs_configure {
 	bool c_fragments;
 	bool c_all_fragments;
 	bool c_dedupe;
+	char c_fragdedupe;
 	bool c_ignore_mtime;
 	bool c_showprogress;
 	bool c_extra_ea_name_prefixes;
@@ -73,10 +80,6 @@ struct erofs_configure {
 	char c_force_chunkformat;
 	/* < 0, xattr disabled and INT_MAX, always use inline xattrs */
 	int c_inline_xattr_tolerance;
-#ifdef EROFS_MT_ENABLED
-	u64 c_mkfs_segment_size;
-	u32 c_mt_workers;
-#endif
 	u32 c_mkfs_pclustersize_max;
 	u32 c_mkfs_pclustersize_def;
 	u32 c_mkfs_pclustersize_packed;
@@ -86,6 +89,11 @@ struct erofs_configure {
 	const char *mount_point;
 	long long c_uid_offset, c_gid_offset;
 	u32 c_root_xattr_isize;
+#ifdef EROFS_MT_ENABLED
+	u64 c_mkfs_segment_size;
+	u32 c_mt_workers;
+	u32 c_mt_async_queue_limit;
+#endif
 #ifdef WITH_ANDROID
 	char *target_out_path;
 	char *fs_config_file;
