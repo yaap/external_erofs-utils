@@ -17,7 +17,7 @@
 #include "erofs/xattr.h"
 #include "erofs/cache.h"
 #include "erofs/fragments.h"
-#include "xxhash.h"
+#include "liberofs_xxhash.h"
 #include "liberofs_private.h"
 
 #ifndef XATTR_SYSTEM_PREFIX
@@ -74,6 +74,28 @@
 #ifndef OVL_XATTR_ORIGIN
 #define OVL_XATTR_ORIGIN OVL_XATTR_TRUSTED_PREFIX OVL_XATTR_ORIGIN_POSTFIX
 #endif
+
+static ssize_t erofs_sys_llistxattr(const char *path, char *list, size_t size)
+{
+#ifdef HAVE_LLISTXATTR
+	return llistxattr(path, list, size);
+#elif defined(__APPLE__)
+	return listxattr(path, list, size, XATTR_NOFOLLOW);
+#endif
+	return 0;
+}
+
+static ssize_t erofs_sys_lgetxattr(const char *path, const char *name,
+				   void *value, size_t size)
+{
+#ifdef HAVE_LGETXATTR
+	return lgetxattr(path, name, value, size);
+#elif defined(__APPLE__)
+	return getxattr(path, name, value, size, 0, XATTR_NOFOLLOW);
+#endif
+	errno = ENODATA;
+	return -1;
+}
 
 #define EA_HASHTABLE_BITS 16
 
@@ -143,6 +165,8 @@ bool erofs_xattr_prefix_matches(const char *key, unsigned int *index,
 {
 	struct xattr_prefix *p;
 
+	*index = 0;
+	*len = 0;
 	for (p = xattr_types; p < xattr_types + ARRAY_SIZE(xattr_types); ++p) {
 		if (p->prefix && !strncmp(p->prefix, key, p->prefix_len)) {
 			*len = p->prefix_len;
@@ -198,13 +222,9 @@ static struct xattr_item *get_xattritem(char *kvbuf, unsigned int len[2])
 	if (!item)
 		return ERR_PTR(-ENOMEM);
 
-	if (!erofs_xattr_prefix_matches(kvbuf, &item->base_index,
-					&item->prefix_len)) {
-		free(item);
-		return ERR_PTR(-ENODATA);
-	}
+	(void)erofs_xattr_prefix_matches(kvbuf, &item->base_index,
+					 &item->prefix_len);
 	DBG_BUGON(len[0] < item->prefix_len);
-
 	INIT_HLIST_NODE(&item->node);
 	item->count = 1;
 	item->kvbuf = kvbuf;
@@ -242,13 +262,7 @@ static struct xattr_item *parse_one_xattr(const char *path, const char *key,
 	len[0] = keylen;
 
 	/* determine length of the value */
-#ifdef HAVE_LGETXATTR
-	ret = lgetxattr(path, key, NULL, 0);
-#elif defined(__APPLE__)
-	ret = getxattr(path, key, NULL, 0, 0, XATTR_NOFOLLOW);
-#else
-	return ERR_PTR(-EOPNOTSUPP);
-#endif
+	ret = erofs_sys_lgetxattr(path, key, NULL, 0);
 	if (ret < 0)
 		return ERR_PTR(-errno);
 	len[1] = ret;
@@ -260,16 +274,9 @@ static struct xattr_item *parse_one_xattr(const char *path, const char *key,
 	memcpy(kvbuf, key, EROFS_XATTR_KSIZE(len));
 	if (len[1]) {
 		/* copy value to buffer */
-#ifdef HAVE_LGETXATTR
-		ret = lgetxattr(path, key, kvbuf + EROFS_XATTR_KSIZE(len),
-				len[1]);
-#elif defined(__APPLE__)
-		ret = getxattr(path, key, kvbuf + EROFS_XATTR_KSIZE(len),
-			       len[1], 0, XATTR_NOFOLLOW);
-#else
-		ret = -EOPNOTSUPP;
-		goto out;
-#endif
+		ret = erofs_sys_lgetxattr(path, key,
+					  kvbuf + EROFS_XATTR_KSIZE(len),
+					  len[1]);
 		if (ret < 0) {
 			ret = -errno;
 			goto out;
@@ -284,12 +291,7 @@ static struct xattr_item *parse_one_xattr(const char *path, const char *key,
 	item = get_xattritem(kvbuf, len);
 	if (!IS_ERR(item))
 		return item;
-	if (item == ERR_PTR(-ENODATA)) {
-		erofs_warn("skipped unidentified xattr: %s", key);
-		ret = 0;
-	} else {
-		ret = PTR_ERR(item);
-	}
+	ret = PTR_ERR(item);
 out:
 	free(kvbuf);
 	return ERR_PTR(ret);
@@ -393,21 +395,15 @@ static bool erofs_is_skipped_xattr(const char *key)
 static int read_xattrs_from_file(const char *path, mode_t mode,
 				 struct list_head *ixattrs)
 {
-#ifdef HAVE_LLISTXATTR
-	ssize_t kllen = llistxattr(path, NULL, 0);
-#elif defined(__APPLE__)
-	ssize_t kllen = listxattr(path, NULL, 0, XATTR_NOFOLLOW);
-#else
-	ssize_t kllen = 0;
-#endif
-	int ret;
+	ssize_t kllen = erofs_sys_llistxattr(path, NULL, 0);
 	char *keylst, *key, *klend;
 	unsigned int keylen;
 	struct xattr_item *item;
+	int ret;
 
 	if (kllen < 0 && errno != ENODATA && errno != EOPNOTSUPP) {
-		erofs_err("llistxattr to get the size of names for %s failed",
-			  path);
+		erofs_err("failed to get the size of the xattr list for %s: %s",
+			  path, strerror(errno));
 		return -errno;
 	}
 
@@ -420,19 +416,13 @@ static int read_xattrs_from_file(const char *path, mode_t mode,
 		return -ENOMEM;
 
 	/* copy the list of attribute keys to the buffer.*/
-#ifdef HAVE_LLISTXATTR
-	kllen = llistxattr(path, keylst, kllen);
-#elif defined(__APPLE__)
-	kllen = listxattr(path, keylst, kllen, XATTR_NOFOLLOW);
+	kllen = erofs_sys_llistxattr(path, keylst, kllen);
 	if (kllen < 0) {
 		erofs_err("llistxattr to get names for %s failed", path);
 		ret = -errno;
 		goto err;
 	}
-#else
-	ret = -EOPNOTSUPP;
-	goto err;
-#endif
+
 	/*
 	 * loop over the list of zero terminated strings with the
 	 * attribute keys. Use the remaining buffer length to determine
@@ -447,13 +437,16 @@ static int read_xattrs_from_file(const char *path, mode_t mode,
 			continue;
 
 		item = parse_one_xattr(path, key, keylen);
+		/* skip inaccessible xattrs */
+		if (item == ERR_PTR(-ENODATA) || !item) {
+			erofs_warn("skipped inaccessible xattr %s in %s",
+				   key, path);
+			continue;
+		}
 		if (IS_ERR(item)) {
 			ret = PTR_ERR(item);
 			goto err;
 		}
-		/* skip unidentified xattrs */
-		if (!item)
-			continue;
 
 		ret = erofs_xattr_add(ixattrs, item);
 		if (ret < 0)
@@ -811,22 +804,24 @@ static int comp_shared_xattr_item(const void *a, const void *b)
 	return la > lb;
 }
 
-int erofs_xattr_write_name_prefixes(struct erofs_sb_info *sbi, FILE *f)
+int erofs_xattr_flush_name_prefixes(struct erofs_sb_info *sbi)
 {
+	int fd = erofs_packedfile(sbi);
 	struct ea_type_node *tnode;
-	off_t offset;
+	s64 offset;
+	int err;
 
 	if (!ea_prefix_count)
 		return 0;
-	offset = ftello(f);
+	offset = lseek(fd, 0, SEEK_CUR);
 	if (offset < 0)
 		return -errno;
-	if (offset > UINT32_MAX)
-		return -EOVERFLOW;
-
 	offset = round_up(offset, 4);
-	if (fseek(f, offset, SEEK_SET))
+	if ((offset >> 2) > UINT32_MAX)
+		return -EOVERFLOW;
+	if (lseek(fd, offset, SEEK_SET) < 0)
 		return -errno;
+
 	sbi->xattr_prefix_start = (u32)offset >> 2;
 	sbi->xattr_prefix_count = ea_prefix_count;
 
@@ -847,10 +842,14 @@ int erofs_xattr_write_name_prefixes(struct erofs_sb_info *sbi, FILE *f)
 		       infix_len);
 		len = sizeof(struct erofs_xattr_long_prefix) + infix_len;
 		u.s.size = cpu_to_le16(len);
-		if (fwrite(&u.s, sizeof(__le16) + len, 1, f) != 1)
+		err = __erofs_io_write(fd, &u.s, sizeof(__le16) + len);
+		if (err != sizeof(__le16) + len) {
+			if (err < 0)
+				return -errno;
 			return -EIO;
+		}
 		offset = round_up(offset + sizeof(__le16) + len, 4);
-		if (fseek(f, offset, SEEK_SET))
+		if (lseek(fd, offset, SEEK_SET) < 0)
 			return -errno;
 	}
 	erofs_sb_set_fragments(sbi);
@@ -926,7 +925,7 @@ int erofs_build_shared_xattrs_from_path(struct erofs_sb_info *sbi, const char *p
 		return -ENOMEM;
 	}
 
-	bh = erofs_balloc(sbi->bmgr, XATTR, shared_xattrs_size, 0, 0);
+	bh = erofs_balloc(sbi->bmgr, XATTR, shared_xattrs_size, 0);
 	if (IS_ERR(bh)) {
 		free(sorted_n);
 		free(buf);
@@ -1052,7 +1051,7 @@ static int init_inode_xattrs(struct erofs_inode *vi)
 	int ret = 0;
 
 	/* the most case is that xattrs of this inode are initialized. */
-	if (vi->flags & EROFS_I_EA_INITED)
+	if (erofs_atomic_read(&vi->flags) & EROFS_I_EA_INITED)
 		return ret;
 
 	/*
@@ -1113,9 +1112,7 @@ static int init_inode_xattrs(struct erofs_inode *vi)
 			le32_to_cpu(*(__le32 *)(it.kaddr + it.ofs));
 		it.ofs += sizeof(__le32);
 	}
-
-	vi->flags |= EROFS_I_EA_INITED;
-
+	erofs_atomic_set_bit(EROFS_I_EA_INITED_BIT, &vi->flags);
 	return ret;
 }
 
@@ -1431,7 +1428,6 @@ int erofs_getxattr(struct erofs_inode *vi, const char *name, char *buffer,
 
 	if (!erofs_xattr_prefix_matches(name, &prefix, &prefixlen))
 		return -ENODATA;
-
 	it.it.sbi = vi->sbi;
 	it.index = prefix;
 	it.name = name + prefixlen;

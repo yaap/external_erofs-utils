@@ -25,6 +25,14 @@
 #define AUFS_WH_DIROPQ		AUFS_WH_PFX AUFS_DIROPQ_NAME
 #endif
 
+/*
+ * These non-existent parent directories are created with the same permissions
+ * as their parent directories.  It is expected that a call to create these
+ * parent directories with the correct permissions will be made later, at which
+ * point the permissions will be updated.  We handle mtime in the same way.
+ * Also see: https://github.com/containerd/containerd/issues/3017
+ *           https://github.com/containerd/containerd/pull/3528
+ */
 static struct erofs_dentry *erofs_rebuild_mkdir(struct erofs_inode *dir,
 						const char *s)
 {
@@ -41,11 +49,15 @@ static struct erofs_dentry *erofs_rebuild_mkdir(struct erofs_inode *dir,
 		return ERR_PTR(-ENOMEM);
 	}
 	inode->i_mode = S_IFDIR | 0755;
+	if (dir->i_mode & S_IWGRP)
+		inode->i_mode |= S_IWGRP;
+	if (dir->i_mode & S_IWOTH)
+		inode->i_mode |= S_IWOTH;
 	inode->i_parent = dir;
-	inode->i_uid = getuid();
-	inode->i_gid = getgid();
-	inode->i_mtime = inode->sbi->build_time;
-	inode->i_mtime_nsec = inode->sbi->build_time_nsec;
+	inode->i_uid = dir->i_uid;
+	inode->i_gid = dir->i_gid;
+	inode->i_mtime = dir->i_mtime;
+	inode->i_mtime_nsec = dir->i_mtime_nsec;
 	inode->dev = dir->dev;
 	erofs_init_empty_dir(inode);
 
@@ -59,18 +71,27 @@ static struct erofs_dentry *erofs_rebuild_mkdir(struct erofs_inode *dir,
 	return d;
 }
 
+struct erofs_dentry *erofs_d_lookup(struct erofs_inode *dir, const char *name)
+{
+	struct erofs_dentry *d;
+
+	list_for_each_entry(d, &dir->i_subdirs, d_child)
+		if (!strcmp(d->name, name))
+			return d;
+	return NULL;
+}
+
 struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
 		char *path, bool aufs, bool *whout, bool *opq, bool to_head)
 {
 	struct erofs_dentry *d = NULL;
-	unsigned int len = strlen(path);
 	char *s = path;
 
 	*whout = false;
 	*opq = false;
 
-	while (s < path + len) {
-		char *slash = memchr(s, '/', path + len - s);
+	while (1) {
+		char *slash = strchr(s, '/');
 
 		if (slash) {
 			if (s == slash) {
@@ -78,60 +99,54 @@ struct erofs_dentry *erofs_rebuild_get_dentry(struct erofs_inode *pwd,
 				continue;
 			}
 			*slash = '\0';
+		} else if (*s == '\0') {
+			break;
 		}
 
-		if (!memcmp(s, ".", 2)) {
-			/* null */
-		} else if (!memcmp(s, "..", 3)) {
-			pwd = pwd->i_parent;
+		if (__erofs_unlikely(is_dot_dotdot(s))) {
+			if (s[1] == '.') {
+				pwd = pwd->i_parent;
+			}
 		} else {
-			struct erofs_inode *inode = NULL;
-
 			if (aufs && !slash) {
-				if (!memcmp(s, AUFS_WH_DIROPQ, sizeof(AUFS_WH_DIROPQ))) {
+				if (!strcmp(s, AUFS_WH_DIROPQ)) {
 					*opq = true;
 					break;
 				}
-				if (!memcmp(s, AUFS_WH_PFX, sizeof(AUFS_WH_PFX) - 1)) {
+				if (!strncmp(s, AUFS_WH_PFX, sizeof(AUFS_WH_PFX) - 1)) {
 					s += sizeof(AUFS_WH_PFX) - 1;
 					*whout = true;
 				}
 			}
 
-			list_for_each_entry(d, &pwd->i_subdirs, d_child) {
-				if (!strcmp(d->name, s)) {
-					if (d->type != EROFS_FT_DIR && slash)
-						return ERR_PTR(-EIO);
-					inode = d->inode;
-					break;
-				}
-			}
-
-			if (inode) {
-				if (to_head) {
+			d = erofs_d_lookup(pwd, s);
+			if (d) {
+				if (d->type != EROFS_FT_DIR) {
+					if (slash)
+						return ERR_PTR(-ENOTDIR);
+				} else if (to_head) {
 					list_del(&d->d_child);
 					list_add(&d->d_child, &pwd->i_subdirs);
 				}
-				pwd = inode;
-			} else if (!slash) {
+				pwd = d->inode;
+			} else if (slash) {
+				d = erofs_rebuild_mkdir(pwd, s);
+				if (IS_ERR(d))
+					return d;
+			} else {
 				d = erofs_d_alloc(pwd, s);
 				if (IS_ERR(d))
 					return d;
 				d->type = EROFS_FT_UNKNOWN;
 				d->inode = pwd;
-			} else {
-				d = erofs_rebuild_mkdir(pwd, s);
-				if (IS_ERR(d))
-					return d;
-				pwd = d->inode;
 			}
+			pwd = d->inode;
 		}
-		if (slash) {
-			*slash = '/';
-			s = slash + 1;
-		} else {
+
+		if (!slash)
 			break;
-		}
+		*slash = '/';
+		s = slash + 1;
 	}
 	return d;
 }
@@ -469,7 +484,7 @@ static int erofs_rebuild_basedir_dirent_iter(struct erofs_dir_context *ctx)
 		if (S_ISDIR(inode->i_mode) &&
 		    (ctx->de_ftype == EROFS_FT_DIR ||
 		     ctx->de_ftype == EROFS_FT_UNKNOWN)) {
-			list_del(&inode->i_hash);
+			erofs_remove_ihash(inode);
 			inode->dev = dir->sbi->dev;
 			inode->i_ino[1] = ctx->de_nid;
 			erofs_insert_ihash(inode);

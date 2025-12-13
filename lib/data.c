@@ -8,6 +8,7 @@
 #include "erofs/internal.h"
 #include "erofs/trace.h"
 #include "erofs/decompress.h"
+#include "erofs/fragments.h"
 
 static int erofs_map_blocks_flatmode(struct erofs_inode *inode,
 				     struct erofs_map_blocks *map,
@@ -62,8 +63,8 @@ err_out:
 	return err;
 }
 
-int erofs_map_blocks(struct erofs_inode *inode,
-		struct erofs_map_blocks *map, int flags)
+int __erofs_map_blocks(struct erofs_inode *inode,
+		       struct erofs_map_blocks *map, int flags)
 {
 	struct erofs_inode *vi = inode;
 	struct erofs_sb_info *sbi = inode->sbi;
@@ -99,7 +100,7 @@ int erofs_map_blocks(struct erofs_inode *inode,
 		return -EIO;
 
 	map->m_la = chunknr << vi->u.chunkbits;
-	map->m_plen = min_t(erofs_off_t, 1UL << vi->u.chunkbits,
+	map->m_plen = min_t(erofs_off_t, 1ULL << vi->u.chunkbits,
 			roundup(inode->i_size - map->m_la, erofs_blksiz(sbi)));
 
 	/* handle block map */
@@ -130,6 +131,14 @@ int erofs_map_blocks(struct erofs_inode *inode,
 out:
 	map->m_llen = map->m_plen;
 	return err;
+}
+
+int erofs_map_blocks(struct erofs_inode *inode,
+		     struct erofs_map_blocks *map, int flags)
+{
+	if (erofs_inode_is_data_compressed(inode->datalayout))
+		return z_erofs_map_blocks_iter(inode, map, flags);
+	return __erofs_map_blocks(inode, map, flags);
 }
 
 int erofs_map_dev(struct erofs_sb_info *sbi, struct erofs_map_dev *map)
@@ -239,19 +248,13 @@ int z_erofs_read_one_data(struct erofs_inode *inode,
 	struct erofs_map_dev mdev;
 	int ret = 0;
 
-	if (map->m_flags & EROFS_MAP_FRAGMENT) {
-		struct erofs_inode packed_inode = {
-			.sbi = sbi,
-			.nid = sbi->packed_nid,
-		};
-
-		ret = erofs_read_inode_from_disk(&packed_inode);
-		if (ret) {
-			erofs_err("failed to read packed inode from disk");
-			return ret;
+	if (map->m_flags & __EROFS_MAP_FRAGMENT) {
+		if (__erofs_unlikely(inode->nid == sbi->packed_nid)) {
+			erofs_err("fragment should not exist in the packed inode %llu",
+				  sbi->packed_nid | 0ULL);
+			return -EFSCORRUPTED;
 		}
-
-		return erofs_pread(&packed_inode, buffer, length - skip,
+		return erofs_packedfile_read(sbi, buffer, length - skip,
 				   inode->fragmentoff + skip);
 	}
 

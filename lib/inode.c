@@ -6,9 +6,6 @@
  * with heavy changes by Gao Xiang <xiang@kernel.org>
  */
 #define _GNU_SOURCE
-#ifdef EROFS_MT_ENABLED
-#include <pthread.h>
-#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -19,6 +16,7 @@
 #endif
 #include <dirent.h>
 #include "erofs/print.h"
+#include "erofs/lock.h"
 #include "erofs/diskbuf.h"
 #include "erofs/inode.h"
 #include "erofs/cache.h"
@@ -85,48 +83,50 @@ unsigned char erofs_ftype_to_dtype(unsigned int filetype)
 	return erofs_dtype_by_ftype[filetype];
 }
 
-#define NR_INODE_HASHTABLE	16384
-
-struct list_head inode_hashtable[NR_INODE_HASHTABLE];
+static struct list_head erofs_ihash[65536];
+static erofs_rwsem_t erofs_ihashlock;
 
 void erofs_inode_manager_init(void)
 {
 	unsigned int i;
 
-	for (i = 0; i < NR_INODE_HASHTABLE; ++i)
-		init_list_head(&inode_hashtable[i]);
+	for (i = 0; i < ARRAY_SIZE(erofs_ihash); ++i)
+		init_list_head(&erofs_ihash[i]);
+	erofs_init_rwsem(&erofs_ihashlock);
 }
 
 void erofs_insert_ihash(struct erofs_inode *inode)
 {
-	unsigned int nr = (inode->i_ino[1] ^ inode->dev) % NR_INODE_HASHTABLE;
+	u32 nr = (inode->i_ino[1] ^ inode->dev) % ARRAY_SIZE(erofs_ihash);
 
-	list_add(&inode->i_hash, &inode_hashtable[nr]);
+	erofs_down_write(&erofs_ihashlock);
+	list_add(&inode->i_hash, &erofs_ihash[nr]);
+	erofs_up_write(&erofs_ihashlock);
+}
+
+void erofs_remove_ihash(struct erofs_inode *inode)
+{
+	erofs_down_write(&erofs_ihashlock);
+	list_del(&inode->i_hash);
+	erofs_up_write(&erofs_ihashlock);
 }
 
 /* get the inode from the (source) inode # */
 struct erofs_inode *erofs_iget(dev_t dev, ino_t ino)
 {
-	struct list_head *head =
-		&inode_hashtable[(ino ^ dev) % NR_INODE_HASHTABLE];
-	struct erofs_inode *inode;
+	u32 nr = (ino ^ dev) % ARRAY_SIZE(erofs_ihash);
+	struct list_head *head = &erofs_ihash[nr];
+	struct erofs_inode *ret = NULL, *inode;
 
-	list_for_each_entry(inode, head, i_hash)
-		if (inode->i_ino[1] == ino && inode->dev == dev)
-			return erofs_igrab(inode);
-	return NULL;
-}
-
-struct erofs_inode *erofs_iget_by_nid(erofs_nid_t nid)
-{
-	struct list_head *head =
-		&inode_hashtable[nid % NR_INODE_HASHTABLE];
-	struct erofs_inode *inode;
-
-	list_for_each_entry(inode, head, i_hash)
-		if (inode->nid == nid)
-			return erofs_igrab(inode);
-	return NULL;
+	erofs_down_read(&erofs_ihashlock);
+	list_for_each_entry(inode, head, i_hash) {
+		if (inode->i_ino[1] == ino && inode->dev == dev) {
+			ret = erofs_igrab(inode);
+			break;
+		}
+	}
+	erofs_up_read(&erofs_ihashlock);
+	return ret;
 }
 
 unsigned int erofs_iput(struct erofs_inode *inode)
@@ -141,16 +141,14 @@ unsigned int erofs_iput(struct erofs_inode *inode)
 		free(d);
 
 	free(inode->compressmeta);
-	if (inode->eof_tailraw)
-		free(inode->eof_tailraw);
-	list_del(&inode->i_hash);
-	if (inode->i_srcpath)
-		free(inode->i_srcpath);
+	free(inode->eof_tailraw);
+	erofs_remove_ihash(inode);
+	free(inode->i_srcpath);
 
 	if (inode->datasource == EROFS_INODE_DATA_SOURCE_DISKBUF) {
 		erofs_diskbuf_close(inode->i_diskbuf);
 		free(inode->i_diskbuf);
-	} else if (inode->i_link) {
+	} else {
 		free(inode->i_link);
 	}
 	free(inode);
@@ -160,14 +158,22 @@ unsigned int erofs_iput(struct erofs_inode *inode)
 struct erofs_dentry *erofs_d_alloc(struct erofs_inode *parent,
 				   const char *name)
 {
-	struct erofs_dentry *d = malloc(sizeof(*d));
+	unsigned int namelen = strlen(name);
+	unsigned int fsz = round_up(namelen + 1, EROFS_DENTRY_NAME_ALIGNMENT);
+	struct erofs_dentry *d;
 
+	if (namelen > EROFS_NAME_LEN) {
+		DBG_BUGON(1);
+		return ERR_PTR(-ENAMETOOLONG);
+	}
+	d = malloc(sizeof(*d) + fsz);
 	if (!d)
 		return ERR_PTR(-ENOMEM);
 
-	strncpy(d->name, name, EROFS_NAME_LEN - 1);
-	d->name[EROFS_NAME_LEN - 1] = '\0';
+	memcpy(d->name, name, namelen);
+	memset(d->name + namelen, 0, fsz - namelen);
 	d->inode = NULL;
+	d->namelen = namelen;
 	d->type = EROFS_FT_UNKNOWN;
 	d->validnid = false;
 	list_add_tail(&d->d_child, &parent->i_subdirs);
@@ -189,7 +195,7 @@ int erofs_allocate_inode_bh_data(struct erofs_inode *inode, erofs_blk_t nblocks)
 
 	/* allocate main data buffer */
 	type = S_ISDIR(inode->i_mode) ? DIRA : DATA;
-	bh = erofs_balloc(bmgr, type, erofs_pos(inode->sbi, nblocks), 0, 0);
+	bh = erofs_balloc(bmgr, type, erofs_pos(inode->sbi, nblocks), 0);
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
 
@@ -208,10 +214,16 @@ int erofs_allocate_inode_bh_data(struct erofs_inode *inode, erofs_blk_t nblocks)
 static int comp_subdir(const void *a, const void *b)
 {
 	const struct erofs_dentry *da, *db;
+	int commonlen, sign;
 
 	da = *((const struct erofs_dentry **)a);
 	db = *((const struct erofs_dentry **)b);
-	return strcmp(da->name, db->name);
+	commonlen = min(round_up(da->namelen, EROFS_DENTRY_NAME_ALIGNMENT),
+			round_up(db->namelen, EROFS_DENTRY_NAME_ALIGNMENT));
+	sign = memcmp(da->name, db->name, commonlen);
+	if (sign)
+		return sign;
+	return cmpsgn(da->namelen, db->namelen);
 }
 
 int erofs_init_empty_dir(struct erofs_inode *dir)
@@ -260,7 +272,7 @@ static int erofs_prepare_dir_file(struct erofs_inode *dir,
 
 	/* let's calculate dir size */
 	list_for_each_entry(d, &dir->i_subdirs, d_child) {
-		int len = strlen(d->name) + sizeof(struct erofs_dirent);
+		int len = d->namelen + sizeof(struct erofs_dirent);
 
 		if (erofs_blkoff(sbi, d_size) + len > erofs_blksiz(sbi))
 			d_size = round_up(d_size, erofs_blksiz(sbi));
@@ -283,7 +295,7 @@ static void fill_dirblock(char *buf, unsigned int size, unsigned int q,
 
 	/* write out all erofs_dirents + filenames */
 	while (head != end) {
-		const unsigned int namelen = strlen(head->name);
+		const unsigned int namelen = head->namelen;
 		struct erofs_dirent d = {
 			.nid = cpu_to_le64(head->nid),
 			.nameoff = cpu_to_le16(q),
@@ -438,8 +450,7 @@ static int erofs_write_dir_file(struct erofs_inode *dir)
 		return ret;
 
 	list_for_each_entry(d, &dir->i_subdirs, d_child) {
-		const unsigned int len = strlen(d->name) +
-			sizeof(struct erofs_dirent);
+		unsigned int len = d->namelen + sizeof(struct erofs_dirent);
 
 		/* XXX: a bit hacky, but to avoid another traversal */
 		if (d->validnid && d->type == EROFS_FT_DIR) {
@@ -553,7 +564,6 @@ static int write_uncompressed_file_from_fd(struct erofs_inode *inode, int fd)
 			return -EIO;
 		}
 	}
-	erofs_droid_blocklist_write(inode, inode->u.i_blkaddr, nblocks);
 	return 0;
 }
 
@@ -581,12 +591,23 @@ int erofs_iflush(struct erofs_inode *inode)
 		struct erofs_inode_compact dic;
 		struct erofs_inode_extended die;
 	} u = {};
+	union erofs_inode_i_u u1;
 	int ret;
 
 	if (inode->bh)
 		off = erofs_btell(inode->bh, false);
 	else
 		off = erofs_iloc(inode);
+
+	if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode) ||
+	    S_ISFIFO(inode->i_mode) || S_ISSOCK(inode->i_mode))
+		u1.rdev = cpu_to_le32(inode->u.i_rdev);
+	else if (is_inode_layout_compression(inode))
+		u1.compressed_blocks = cpu_to_le32(inode->u.i_blocks);
+	else if (inode->datalayout == EROFS_INODE_CHUNK_BASED)
+		u1.c.format = cpu_to_le16(inode->u.chunkformat);
+	else
+		u1.raw_blkaddr = cpu_to_le32(inode->u.i_blkaddr);
 
 	switch (inode->inode_isize) {
 	case sizeof(struct erofs_inode_compact):
@@ -600,28 +621,7 @@ int erofs_iflush(struct erofs_inode *inode)
 
 		u.dic.i_uid = cpu_to_le16((u16)inode->i_uid);
 		u.dic.i_gid = cpu_to_le16((u16)inode->i_gid);
-
-		switch (inode->i_mode & S_IFMT) {
-		case S_IFCHR:
-		case S_IFBLK:
-		case S_IFIFO:
-		case S_IFSOCK:
-			u.dic.i_u.rdev = cpu_to_le32(inode->u.i_rdev);
-			break;
-
-		default:
-			if (is_inode_layout_compression(inode))
-				u.dic.i_u.compressed_blocks =
-					cpu_to_le32(inode->u.i_blocks);
-			else if (inode->datalayout ==
-					EROFS_INODE_CHUNK_BASED)
-				u.dic.i_u.c.format =
-					cpu_to_le16(inode->u.chunkformat);
-			else
-				u.dic.i_u.raw_blkaddr =
-					cpu_to_le32(inode->u.i_blkaddr);
-			break;
-		}
+		u.dic.i_u = u1;
 		break;
 	case sizeof(struct erofs_inode_extended):
 		u.die.i_format = cpu_to_le16(1 | (inode->datalayout << 1));
@@ -637,28 +637,7 @@ int erofs_iflush(struct erofs_inode *inode)
 
 		u.die.i_mtime = cpu_to_le64(inode->i_mtime);
 		u.die.i_mtime_nsec = cpu_to_le32(inode->i_mtime_nsec);
-
-		switch (inode->i_mode & S_IFMT) {
-		case S_IFCHR:
-		case S_IFBLK:
-		case S_IFIFO:
-		case S_IFSOCK:
-			u.die.i_u.rdev = cpu_to_le32(inode->u.i_rdev);
-			break;
-
-		default:
-			if (is_inode_layout_compression(inode))
-				u.die.i_u.compressed_blocks =
-					cpu_to_le32(inode->u.i_blocks);
-			else if (inode->datalayout ==
-					EROFS_INODE_CHUNK_BASED)
-				u.die.i_u.c.format =
-					cpu_to_le16(inode->u.chunkformat);
-			else
-				u.die.i_u.raw_blkaddr =
-					cpu_to_le32(inode->u.i_blkaddr);
-			break;
-		}
+		u.die.i_u = u1;
 		break;
 	default:
 		erofs_err("unsupported on-disk inode version of nid %llu",
@@ -777,7 +756,7 @@ static int erofs_prepare_inode_buffer(struct erofs_inode *inode)
 			inode->datalayout = EROFS_INODE_FLAT_PLAIN;
 	}
 
-	bh = erofs_balloc(bmgr, INODE, inodesize, 0, inode->idata_size);
+	bh = erofs_balloc(bmgr, INODE, inodesize, inode->idata_size);
 	if (bh == ERR_PTR(-ENOSPC)) {
 		int ret;
 
@@ -790,7 +769,7 @@ noinline:
 		ret = erofs_prepare_tail_block(inode);
 		if (ret)
 			return ret;
-		bh = erofs_balloc(bmgr, INODE, inodesize, 0, 0);
+		bh = erofs_balloc(bmgr, INODE, inodesize, 0);
 		if (IS_ERR(bh))
 			return PTR_ERR(bh);
 		DBG_BUGON(inode->bh_inline);
@@ -848,6 +827,7 @@ static struct erofs_bhops erofs_write_inline_bhops = {
 
 static int erofs_write_tail_end(struct erofs_inode *inode)
 {
+	static const u8 zeroed[EROFS_MAX_BLOCK_SIZE];
 	struct erofs_sb_info *sbi = inode->sbi;
 	struct erofs_buffer_head *bh, *ibh;
 
@@ -863,15 +843,16 @@ static int erofs_write_tail_end(struct erofs_inode *inode)
 
 		ibh->fsprivate = erofs_igrab(inode);
 		ibh->op = &erofs_write_inline_bhops;
-
-		erofs_droid_blocklist_write_tail_end(inode, NULL_ADDR);
 	} else {
+		struct iovec iov[2];
+		erofs_off_t pos;
 		int ret;
-		erofs_off_t pos, zero_pos;
+		bool h0;
 
 		if (!bh) {
-			bh = erofs_balloc(sbi->bmgr, DATA,
-					  erofs_blksiz(sbi), 0, 0);
+			bh = erofs_balloc(sbi->bmgr,
+					  S_ISDIR(inode->i_mode) ? DIRA: DATA,
+					  erofs_blksiz(sbi), 0);
 			if (IS_ERR(bh))
 				return PTR_ERR(bh);
 			bh->op = &erofs_skip_write_bhops;
@@ -896,30 +877,22 @@ static int erofs_write_tail_end(struct erofs_inode *inode)
 		pos = erofs_btell(bh, true) - erofs_blksiz(sbi);
 
 		/* 0'ed data should be padded at head for 0padding conversion */
-		if (erofs_sb_has_lz4_0padding(sbi) && inode->compressed_idata) {
-			zero_pos = pos;
-			pos += erofs_blksiz(sbi) - inode->idata_size;
-		} else {
-			/* pad 0'ed data for the other cases */
-			zero_pos = pos + inode->idata_size;
-		}
-		ret = erofs_dev_write(sbi, inode->idata, pos, inode->idata_size);
-		if (ret)
-			return ret;
-
+		h0 = erofs_sb_has_lz4_0padding(sbi) && inode->compressed_idata;
 		DBG_BUGON(inode->idata_size > erofs_blksiz(sbi));
-		if (inode->idata_size < erofs_blksiz(sbi)) {
-			ret = erofs_dev_fillzero(sbi, zero_pos,
-					   erofs_blksiz(sbi) - inode->idata_size,
-					   false);
-			if (ret)
-				return ret;
-		}
+
+		iov[h0] = (struct iovec) { .iov_base = inode->idata,
+					   .iov_len = inode->idata_size };
+		iov[!h0] = (struct iovec) { .iov_base = (u8 *)zeroed,
+				erofs_blksiz(sbi) - inode->idata_size };
+		ret = erofs_io_pwritev(&sbi->bdev, iov, 2, pos);
+		if (ret < 0)
+			return ret;
+		else if (ret < erofs_blksiz(sbi))
+			return -EIO;
+
 		inode->idata_size = 0;
 		free(inode->idata);
 		inode->idata = NULL;
-
-		erofs_droid_blocklist_write_tail_end(inode, erofs_blknr(sbi, pos));
 	}
 out:
 	/* now bh_data can drop directly */
@@ -934,7 +907,8 @@ out:
 	return 0;
 }
 
-static bool erofs_should_use_inode_extended(struct erofs_inode *inode)
+static bool erofs_should_use_inode_extended(struct erofs_inode *inode,
+					    const char *path)
 {
 	if (cfg.c_force_inodeversion == FORCE_INODE_EXTENDED)
 		return true;
@@ -948,7 +922,8 @@ static bool erofs_should_use_inode_extended(struct erofs_inode *inode)
 		return true;
 	if (inode->i_nlink > USHRT_MAX)
 		return true;
-	if ((inode->i_mtime != inode->sbi->build_time ||
+	if (path != EROFS_PACKED_INODE &&
+	    (inode->i_mtime != inode->sbi->build_time ||
 	     inode->i_mtime_nsec != inode->sbi->build_time_nsec) &&
 	    !cfg.c_ignore_mtime)
 		return true;
@@ -1040,6 +1015,11 @@ int __erofs_fill_inode(struct erofs_inode *inode, struct stat *st,
 		erofs_err("gid overflow @ %s", path);
 	inode->i_gid += cfg.c_gid_offset;
 
+	if (path == EROFS_PACKED_INODE) {
+		inode->i_mtime = sbi->build_time;
+		inode->i_mtime_nsec = sbi->build_time_nsec;
+		return 0;
+	}
 	inode->i_mtime = st->st_mtime;
 	inode->i_mtime_nsec = ST_MTIM_NSEC(st);
 
@@ -1053,7 +1033,6 @@ int __erofs_fill_inode(struct erofs_inode *inode, struct stat *st,
 	default:
 		break;
 	}
-
 	return 0;
 }
 
@@ -1089,7 +1068,7 @@ static int erofs_fill_inode(struct erofs_inode *inode, struct stat *st,
 	if (!inode->i_srcpath)
 		return -ENOMEM;
 
-	if (erofs_should_use_inode_extended(inode)) {
+	if (erofs_should_use_inode_extended(inode, path)) {
 		if (cfg.c_force_inodeversion == FORCE_INODE_COMPACT) {
 			erofs_err("file %s cannot be in compact form",
 				  inode->i_srcpath);
@@ -1115,6 +1094,11 @@ struct erofs_inode *erofs_new_inode(struct erofs_sb_info *sbi)
 		return ERR_PTR(-ENOMEM);
 
 	inode->sbi = sbi;
+	/*
+	 * By default, newly allocated in-memory inodes are associated with
+	 * the target filesystem rather than any other foreign sources.
+	 */
+	inode->dev = sbi->dev;
 	inode->i_count = 1;
 	inode->datalayout = EROFS_INODE_FLAT_PLAIN;
 
@@ -1186,7 +1170,7 @@ static int erofs_inode_reserve_data_blocks(struct erofs_inode *inode)
 	struct erofs_buffer_head *bh;
 
 	/* allocate data blocks */
-	bh = erofs_balloc(sbi->bmgr, DATA, alignedsz, 0, 0);
+	bh = erofs_balloc(sbi->bmgr, DATA, alignedsz, 0);
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
 
@@ -1239,6 +1223,7 @@ out:
 		inode->i_diskbuf = NULL;
 		inode->datasource = EROFS_INODE_DATA_SOURCE_NONE;
 	} else {
+		DBG_BUGON(ctx->fd < 0);
 		close(ctx->fd);
 	}
 	return ret;
@@ -1298,6 +1283,9 @@ static int erofs_mkfs_jobfn(struct erofs_mkfs_jobitem *item)
 	struct erofs_inode *inode = item->u.inode;
 	int ret;
 
+	if (item->type >= EROFS_MKFS_JOB_MAX)
+		return 1;
+
 	if (item->type == EROFS_MKFS_JOB_NDIR)
 		return erofs_mkfs_handle_nondirectory(&item->u.ndir);
 
@@ -1330,9 +1318,8 @@ struct erofs_mkfs_dfops {
 	struct erofs_mkfs_jobitem *queue;
 	unsigned int entries, head, tail;
 	bool idle;	/* initialize as false before the dfops worker runs */
+	bool exited;
 };
-
-#define EROFS_MT_QUEUE_SIZE 128
 
 static void erofs_mkfs_flushjobs(struct erofs_sb_info *sbi)
 {
@@ -1344,7 +1331,7 @@ static void erofs_mkfs_flushjobs(struct erofs_sb_info *sbi)
 	pthread_mutex_unlock(&q->lock);
 }
 
-static void *erofs_mkfs_pop_jobitem(struct erofs_mkfs_dfops *q)
+static void *erofs_mkfs_top_jobitem(struct erofs_mkfs_dfops *q)
 {
 	struct erofs_mkfs_jobitem *item;
 
@@ -1355,31 +1342,38 @@ static void *erofs_mkfs_pop_jobitem(struct erofs_mkfs_dfops *q)
 		pthread_cond_signal(&q->drain);
 		pthread_cond_wait(&q->empty, &q->lock);
 	}
-
-	item = q->queue + q->head;
-	q->head = (q->head + 1) & (q->entries - 1);
-
-	pthread_cond_signal(&q->full);
+	item = q->queue + (q->head & (q->entries - 1));
 	pthread_mutex_unlock(&q->lock);
 	return item;
+}
+
+static void erofs_mkfs_pop_jobitem(struct erofs_mkfs_dfops *q)
+{
+	pthread_mutex_lock(&q->lock);
+	DBG_BUGON(q->head == q->tail);
+	++q->head;
+	pthread_cond_signal(&q->full);
+	pthread_mutex_unlock(&q->lock);
 }
 
 static void *z_erofs_mt_dfops_worker(void *arg)
 {
 	struct erofs_sb_info *sbi = arg;
-	int ret = 0;
+	struct erofs_mkfs_dfops *dfops = sbi->mkfs_dfops;
+	int ret;
 
-	while (1) {
+	do {
 		struct erofs_mkfs_jobitem *item;
 
-		item = erofs_mkfs_pop_jobitem(sbi->mkfs_dfops);
-		if (item->type >= EROFS_MKFS_JOB_MAX)
-			break;
+		item = erofs_mkfs_top_jobitem(dfops);
 		ret = erofs_mkfs_jobfn(item);
-		if (ret)
-			break;
-	}
-	pthread_exit((void *)(uintptr_t)ret);
+		erofs_mkfs_pop_jobitem(dfops);
+	} while (!ret);
+
+	dfops->exited = true;
+	if (ret < 0)
+		pthread_cond_signal(&dfops->full);
+	pthread_exit((void *)(uintptr_t)(ret < 0 ? ret : 0));
 }
 
 static int erofs_mkfs_go(struct erofs_sb_info *sbi,
@@ -1390,14 +1384,18 @@ static int erofs_mkfs_go(struct erofs_sb_info *sbi,
 
 	pthread_mutex_lock(&q->lock);
 
-	while (((q->tail + 1) & (q->entries - 1)) == q->head)
+	while (q->tail - q->head >= q->entries) {
+		if (q->exited) {
+			pthread_mutex_unlock(&q->lock);
+			return -ECHILD;
+		}
 		pthread_cond_wait(&q->full, &q->lock);
+	}
 
-	item = q->queue + q->tail;
+	item = q->queue + (q->tail++ & (q->entries - 1));
 	item->type = type;
 	if (size)
 		memcpy(&item->u, elem, size);
-	q->tail = (q->tail + 1) & (q->entries - 1);
 	q->idle = false;
 
 	pthread_cond_signal(&q->empty);
@@ -1599,7 +1597,7 @@ static int erofs_mkfs_handle_inode(struct erofs_inode *inode)
 		return ret;
 
 	if (!S_ISDIR(inode->i_mode)) {
-		struct erofs_mkfs_job_ndir_ctx ctx = { .inode = inode };
+		struct erofs_mkfs_job_ndir_ctx ctx = { .inode = inode, .fd = -1 };
 
 		if (!S_ISLNK(inode->i_mode) && inode->i_size) {
 			ctx.fd = open(inode->i_srcpath, O_RDONLY | O_BINARY);
@@ -1634,7 +1632,7 @@ static int erofs_rebuild_handle_inode(struct erofs_inode *inode,
 	erofs_update_progressinfo("Processing %s ...", trimmed);
 	free(trimmed);
 
-	if (erofs_should_use_inode_extended(inode)) {
+	if (erofs_should_use_inode_extended(inode, inode->i_srcpath)) {
 		if (cfg.c_force_inodeversion == FORCE_INODE_COMPACT) {
 			erofs_err("file %s cannot be in compact form",
 				  inode->i_srcpath);
@@ -1714,7 +1712,7 @@ static int erofs_mkfs_dump_tree(struct erofs_inode *root, bool rebuild,
 	if (incremental) {
 		root->dev = root->sbi->dev;
 		root->i_ino[1] = sbi->root_nid;
-		list_del(&root->i_hash);
+		erofs_remove_ihash(root);
 		erofs_insert_ihash(root);
 	} else if (cfg.c_root_xattr_isize) {
 		if (cfg.c_root_xattr_isize > EROFS_XATTR_ALIGN(
@@ -1821,17 +1819,47 @@ static int __erofs_mkfs_build_tree(struct erofs_mkfs_buildtree_ctx *ctx)
 }
 
 #ifdef EROFS_MT_ENABLED
+
+#ifdef HAVE_SYS_RESOURCE_H
+#include <sys/resource.h>
+#endif
+
+static int erofs_get_fdlimit(void)
+{
+#if defined(HAVE_SYS_RESOURCE_H) && defined(HAVE_GETRLIMIT)
+	struct rlimit rlim;
+	int err;
+
+	err = getrlimit(RLIMIT_NOFILE, &rlim);
+	if (err < 0)
+		return _POSIX_OPEN_MAX;
+	if (rlim.rlim_cur == RLIM_INFINITY)
+		return 0;
+	return rlim.rlim_cur;
+#else
+	return _POSIX_OPEN_MAX;
+#endif
+}
+
 static int erofs_mkfs_build_tree(struct erofs_mkfs_buildtree_ctx *ctx)
 {
+	struct erofs_sb_info *sbi = ctx->sbi ? ctx->sbi : ctx->u.root->sbi;
 	struct erofs_mkfs_dfops *q;
 	int err, err2;
-	struct erofs_sb_info *sbi = ctx->sbi ? ctx->sbi : ctx->u.root->sbi;
+	void *retval;
 
 	q = calloc(1, sizeof(*q));
 	if (!q)
 		return -ENOMEM;
 
-	q->entries = EROFS_MT_QUEUE_SIZE;
+	if (cfg.c_mt_async_queue_limit) {
+		q->entries = cfg.c_mt_async_queue_limit;
+	} else {
+		err = roundup_pow_of_two(erofs_get_fdlimit()) >> 1;
+		q->entries = err && err < 32768 ? err : 32768;
+	}
+	erofs_dbg("Set the asynchronous queue size to %u", q->entries);
+
 	q->queue = malloc(q->entries * sizeof(*q->queue));
 	if (!q->queue) {
 		free(q);
@@ -1850,9 +1878,13 @@ static int erofs_mkfs_build_tree(struct erofs_mkfs_buildtree_ctx *ctx)
 
 	err = __erofs_mkfs_build_tree(ctx);
 	erofs_mkfs_go(sbi, ~0, NULL, 0);
-	err2 = pthread_join(sbi->dfops_worker, NULL);
-	if (!err)
+	err2 = pthread_join(sbi->dfops_worker, &retval);
+	DBG_BUGON(!q->exited);
+	if (!err || err == -ECHILD) {
 		err = err2;
+		if (!err)
+			err = (intptr_t)retval;
+	}
 
 fail:
 	pthread_cond_destroy(&q->empty);
