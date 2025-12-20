@@ -11,19 +11,6 @@ AC_CONFIG_SRCDIR([config.h.in])
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_AUX_DIR(config)
-
-AC_CANONICAL_TARGET
-
-build_linux=no
-case "${target_os}" in
-  linux*)
-    build_linux=yes
-    ;;
-esac
-
-# OS-specific treatment
-AM_CONDITIONAL([OS_LINUX], [test "$build_linux" = "yes"])
-
 AM_INIT_AUTOMAKE([foreign -Wall])
 
 # Checks for programs.
@@ -161,10 +148,6 @@ AC_ARG_WITH(qpl,
       [Enable and build with Intel QPL support @<:@default=disabled@:>@])], [],
       [with_qpl="no"])
 
-AC_ARG_WITH(xxhash,
-   [AS_HELP_STRING([--with-xxhash],
-      [Enable and build with libxxhash support @<:@default=auto@:>@])])
-
 AC_ARG_ENABLE(fuse,
    [AS_HELP_STRING([--enable-fuse], [enable erofsfuse @<:@default=no@:>@])],
    [enable_fuse="$enableval"], [enable_fuse="no"])
@@ -194,7 +177,6 @@ AC_ARG_WITH(selinux,
 AC_CHECK_HEADERS(m4_flatten([
 	dirent.h
 	execinfo.h
-	endian.h
 	fcntl.h
 	getopt.h
 	inttypes.h
@@ -211,13 +193,11 @@ AC_CHECK_HEADERS(m4_flatten([
 	sys/ioctl.h
 	sys/mman.h
 	sys/random.h
-	sys/resource.h
 	sys/sendfile.h
 	sys/stat.h
 	sys/statfs.h
 	sys/sysmacros.h
 	sys/time.h
-	sys/uio.h
 	unistd.h
 ]))
 
@@ -266,8 +246,6 @@ AC_CHECK_FUNCS(m4_flatten([
 	backtrace
 	copy_file_range
 	fallocate
-	getrandom
-	getrlimit
 	gettimeofday
 	lgetxattr
 	llistxattr
@@ -278,7 +256,6 @@ AC_CHECK_FUNCS(m4_flatten([
 	ftello64
 	pread64
 	pwrite64
-	pwritev
 	posix_fadvise
 	fstatfs
 	sendfile
@@ -287,6 +264,7 @@ AC_CHECK_FUNCS(m4_flatten([
 	strrchr
 	strtoull
 	sysconf
+	tmpfile64
 	utimensat]))
 
 # Detect maximum block size if necessary
@@ -553,31 +531,6 @@ AS_IF([test "x$with_qpl" != "xno"], [
   ])
 ])
 
-# Configure libxxhash
-have_xxhash="no"
-AS_IF([test "x$with_xxhash" != "xno"], [
-  PKG_CHECK_MODULES([libxxhash], [libxxhash], [
-    # Paranoia: don't trust the result reported by pkgconfig before trying out
-    saved_LIBS="$LIBS"
-    saved_CPPFLAGS=${CPPFLAGS}
-    CPPFLAGS="${libxxhash_CFLAGS} ${CPPFLAGS}"
-    LIBS="${libxxhash_LIBS} $LIBS"
-    AC_CHECK_HEADERS([xxhash.h],[
-      AC_CHECK_LIB(xxhash, XXH32, [], [
-        AC_MSG_ERROR([libxxhash doesn't work properly])])
-      AC_CHECK_DECL(XXH32, [have_xxhash="yes"],
-        [AC_MSG_ERROR([libxxhash doesn't work properly])], [[
-#include <xxhash.h>
-      ]])
-    ])
-    LIBS="${saved_LIBS}"
-    CPPFLAGS="${saved_CPPFLAGS}"], [
-    AS_IF([test "x$with_xxhash" = "xyes"], [
-      AC_MSG_ERROR([Cannot find proper libxxhash])
-    ])
-  ])
-])
-
 # Enable 64-bit off_t
 CFLAGS+=" -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64"
 
@@ -600,7 +553,6 @@ AM_CONDITIONAL([ENABLE_LIBLZMA], [test "x${have_liblzma}" = "xyes"])
 AM_CONDITIONAL([ENABLE_LIBDEFLATE], [test "x${have_libdeflate}" = "xyes"])
 AM_CONDITIONAL([ENABLE_LIBZSTD], [test "x${have_libzstd}" = "xyes"])
 AM_CONDITIONAL([ENABLE_QPL], [test "x${have_qpl}" = "xyes"])
-AM_CONDITIONAL([ENABLE_XXHASH], [test "x${have_xxhash}" = "xyes"])
 AM_CONDITIONAL([ENABLE_STATIC_FUSE], [test "x${enable_static_fuse}" = "xyes"])
 
 if test "x$have_uuid" = "xyes"; then
@@ -648,10 +600,6 @@ if test "x$have_qpl" = "xyes"; then
   AC_SUBST([libqpl_CFLAGS])
 fi
 
-if test "x$have_xxhash" = "xyes"; then
-  AC_DEFINE([HAVE_XXHASH], 1, [Define to 1 if xxhash is found])
-fi
-
 # Dump maximum block size
 AS_IF([test "x$erofs_cv_max_block_size" = "x"],
       [$erofs_cv_max_block_size = 4096], [])
@@ -665,6 +613,5 @@ AC_CONFIG_FILES([Makefile
 		 mkfs/Makefile
 		 dump/Makefile
 		 fuse/Makefile
-		 fsck/Makefile
-		 contrib/Makefile])
+		 fsck/Makefile])
 AC_OUTPUT

@@ -35,20 +35,17 @@ struct erofs_bhops {
 
 struct erofs_buffer_head {
 	struct list_head list;
-	union {
-		struct {
-			struct erofs_buffer_block *block;
-			const struct erofs_bhops *op;
-		};
-		erofs_blk_t nblocks;
-	};
+	struct erofs_buffer_block *block;
+
 	erofs_off_t off;
+	const struct erofs_bhops *op;
+
 	void *fsprivate;
 };
 
 struct erofs_buffer_block {
 	struct list_head list;
-	struct list_head sibling;	/* blocks of the same waterline */
+	struct list_head mapped_list;
 
 	erofs_blk_t blkaddr;
 	int type;
@@ -59,18 +56,14 @@ struct erofs_buffer_block {
 struct erofs_bufmgr {
 	struct erofs_sb_info *sbi;
 
-	/* buckets for all buffer blocks to boost up allocation */
-	struct list_head watermeter[META + 1][2][EROFS_MAX_BLOCK_SIZE];
-	unsigned long bktmap[META + 1][2][EROFS_MAX_BLOCK_SIZE / BITS_PER_LONG];
+	/* buckets for all mapped buffer blocks to boost up allocation */
+	struct list_head mapped_buckets[META + 1][EROFS_MAX_BLOCK_SIZE];
 
 	struct erofs_buffer_block blkh;
 	erofs_blk_t tail_blkaddr, metablkcnt;
 
 	/* last mapped buffer block to accelerate erofs_mapbh() */
 	struct erofs_buffer_block *last_mapped_block;
-
-	/* align data block addresses to multiples of `dsunit` */
-	unsigned int dsunit;
 };
 
 static inline const int get_alignsize(struct erofs_sb_info *sbi, int type,
@@ -127,6 +120,7 @@ int erofs_bh_balloon(struct erofs_buffer_head *bh, erofs_off_t incr);
 
 struct erofs_buffer_head *erofs_balloc(struct erofs_bufmgr *bmgr,
 				       int type, erofs_off_t size,
+				       unsigned int required_ext,
 				       unsigned int inline_ext);
 struct erofs_buffer_head *erofs_battach(struct erofs_buffer_head *bh,
 					int type, unsigned int size);

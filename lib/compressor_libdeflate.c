@@ -9,8 +9,6 @@
 
 struct erofs_libdeflate_context {
 	struct libdeflate_compressor *strm;
-	u8 *fitblk_buffer;
-	unsigned int fitblk_bufsiz;
 	size_t last_uncompressed_size;
 };
 
@@ -23,15 +21,7 @@ static int libdeflate_compress_destsize(const struct erofs_compress *c,
 	size_t l_csize = 0;
 	size_t r = *srcsize + 1; /* smallest input that doesn't fit so far */
 	size_t m;
-
-	if (dstsize + 9 > ctx->fitblk_bufsiz) {
-		u8 *buf = realloc(ctx->fitblk_buffer, dstsize + 9);
-
-		if (!buf)
-			return -ENOMEM;
-		ctx->fitblk_bufsiz = dstsize + 9;
-		ctx->fitblk_buffer = buf;
-	}
+	u8 tmpbuf[dstsize + 9];
 
 	if (ctx->last_uncompressed_size)
 		m = ctx->last_uncompressed_size * 15 / 16;
@@ -44,12 +34,11 @@ static int libdeflate_compress_destsize(const struct erofs_compress *c,
 		m = min(m, r - 1);
 
 		csize = libdeflate_deflate_compress(ctx->strm, src, m,
-						    ctx->fitblk_buffer,
-						    dstsize + 9);
+						    tmpbuf, dstsize + 9);
 		/*printf("Tried %zu => %zu\n", m, csize);*/
 		if (csize > 0 && csize <= dstsize) {
 			/* Fits */
-			memcpy(dst, ctx->fitblk_buffer, csize);
+			memcpy(dst, tmpbuf, csize);
 			l = m;
 			l_csize = csize;
 			if (r <= l + 1 || csize +
@@ -96,7 +85,6 @@ static int compressor_libdeflate_exit(struct erofs_compress *c)
 	if (!ctx)
 		return -EINVAL;
 	libdeflate_free_compressor(ctx->strm);
-	free(ctx->fitblk_buffer);
 	free(ctx);
 	return 0;
 }

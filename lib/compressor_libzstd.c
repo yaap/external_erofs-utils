@@ -4,34 +4,20 @@
 #include "erofs/config.h"
 #include <zstd.h>
 #include <zstd_errors.h>
-#include <stdlib.h>
+#include <alloca.h>
 #include "compressor.h"
 #include "erofs/atomic.h"
-
-struct erofs_libzstd_context {
-	ZSTD_CCtx *cctx;
-	u8 *fitblk_buffer;
-	unsigned int fitblk_bufsiz;
-};
 
 static int libzstd_compress_destsize(const struct erofs_compress *c,
 				     const void *src, unsigned int *srcsize,
 				     void *dst, unsigned int dstsize)
 {
-	struct erofs_libzstd_context *ctx = c->private_data;
+	ZSTD_CCtx *cctx = c->private_data;
 	size_t l = 0;		/* largest input that fits so far */
 	size_t l_csize = 0;
 	size_t r = *srcsize + 1; /* smallest input that doesn't fit so far */
 	size_t m;
-
-	if (dstsize + 32 > ctx->fitblk_bufsiz) {
-		u8 *buf = realloc(ctx->fitblk_buffer, dstsize + 32);
-
-		if (!buf)
-			return -ENOMEM;
-		ctx->fitblk_bufsiz = dstsize + 32;
-		ctx->fitblk_buffer = buf;
-	}
+	u8 *fitblk_buffer = alloca(dstsize + 32);
 
 	m = dstsize * 4;
 	for (;;) {
@@ -40,7 +26,7 @@ static int libzstd_compress_destsize(const struct erofs_compress *c,
 		m = max(m, l + 1);
 		m = min(m, r - 1);
 
-		csize = ZSTD_compress2(ctx->cctx, ctx->fitblk_buffer,
+		csize = ZSTD_compress2(cctx, fitblk_buffer,
 				       dstsize + 32, src, m);
 		if (ZSTD_isError(csize)) {
 			if (ZSTD_getErrorCode(csize) == ZSTD_error_dstSize_tooSmall)
@@ -50,7 +36,7 @@ static int libzstd_compress_destsize(const struct erofs_compress *c,
 
 		if (csize > 0 && csize <= dstsize) {
 			/* Fits */
-			memcpy(dst, ctx->fitblk_buffer, csize);
+			memcpy(dst, fitblk_buffer, csize);
 			l = m;
 			l_csize = csize;
 			if (r <= l + 1 || csize + 1 >= dstsize)
@@ -75,14 +61,9 @@ doesnt_fit:
 
 static int compressor_libzstd_exit(struct erofs_compress *c)
 {
-	struct erofs_libzstd_context *ctx = c->private_data;
-
-	if (!ctx)
+	if (!c->private_data)
 		return -EINVAL;
-
-	free(ctx->fitblk_buffer);
-	ZSTD_freeCCtx(ctx->cctx);
-	free(ctx);
+	ZSTD_freeCCtx(c->private_data);
 	return 0;
 }
 
@@ -120,41 +101,27 @@ static int erofs_compressor_libzstd_setdictsize(struct erofs_compress *c,
 
 static int compressor_libzstd_init(struct erofs_compress *c)
 {
-	struct erofs_libzstd_context *ctx = c->private_data;
 	static erofs_atomic_bool_t __warnonce;
-	ZSTD_CCtx *cctx;
-	size_t errcode;
-	int err;
+	ZSTD_CCtx *cctx = c->private_data;
+	size_t err;
 
-	if (ctx) {
-		ZSTD_freeCCtx(ctx->cctx);
-		ctx->cctx = NULL;
-		c->private_data = NULL;
-	} else {
-		ctx = calloc(1, sizeof(*ctx));
-		if (!ctx)
-			return -ENOMEM;
-	}
+	ZSTD_freeCCtx(cctx);
 	cctx = ZSTD_createCCtx();
-	if (!cctx) {
-		err = -ENOMEM;
-		goto out_err;
-	}
+	if (!cctx)
+		return -ENOMEM;
 
-	err = -EINVAL;
-	errcode = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, c->compression_level);
-	if (ZSTD_isError(errcode)) {
+	err = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, c->compression_level);
+	if (ZSTD_isError(err)) {
 		erofs_err("failed to set compression level: %s",
-			  ZSTD_getErrorName(errcode));
-		goto out_err;
+			  ZSTD_getErrorName(err));
+		return -EINVAL;
 	}
-	errcode = ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, ilog2(c->dict_size));
-	if (ZSTD_isError(errcode)) {
-		erofs_err("failed to set window log: %s", ZSTD_getErrorName(errcode));
-		goto out_err;
+	err = ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, ilog2(c->dict_size));
+	if (ZSTD_isError(err)) {
+		erofs_err("failed to set window log: %s", ZSTD_getErrorName(err));
+		return -EINVAL;
 	}
-	ctx->cctx = cctx;
-	c->private_data = ctx;
+	c->private_data = cctx;
 
 	if (!erofs_atomic_test_and_set(&__warnonce)) {
 		erofs_warn("EXPERIMENTAL libzstd compressor in use. Note that `fitblk` isn't supported by upstream zstd for now.");
@@ -162,10 +129,6 @@ static int compressor_libzstd_init(struct erofs_compress *c)
 		erofs_info("You could clarify further needs in zstd repository <https://github.com/facebook/zstd/issues> for reference too.");
 	}
 	return 0;
-out_err:
-	ZSTD_freeCCtx(cctx);
-	free(ctx);
-	return err;
 }
 
 const struct erofs_compressor erofs_compressor_libzstd = {

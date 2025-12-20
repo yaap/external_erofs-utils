@@ -26,28 +26,6 @@
 #define EROFS_MODNAME	"erofs_io"
 #include "erofs/print.h"
 
-ssize_t __erofs_io_write(int fd, const void *buf, size_t len)
-{
-	ssize_t ret, written = 0;
-
-	do {
-		ret = write(fd, buf, len - written);
-		if (ret <= 0) {
-			if (!ret)
-				break;
-			if (errno != EINTR) {
-				erofs_err("failed to write: %s", strerror(errno));
-				return -errno;
-			}
-			ret = 0;
-		}
-		buf += ret;
-		written += ret;
-	} while (written < len);
-
-	return written;
-}
-
 int erofs_io_fstat(struct erofs_vfile *vf, struct stat *buf)
 {
 	if (__erofs_unlikely(cfg.c_dry_run)) {
@@ -93,39 +71,6 @@ ssize_t erofs_io_pwrite(struct erofs_vfile *vf, const void *buf,
 		written += ret;
 	} while (written < len);
 
-	return written;
-}
-
-ssize_t erofs_io_pwritev(struct erofs_vfile *vf, const struct iovec *iov,
-			 int iovcnt, u64 pos)
-{
-	ssize_t ret, written;
-	int i;
-
-	if (__erofs_unlikely(cfg.c_dry_run))
-		return 0;
-
-#ifdef HAVE_PWRITEV
-	if (!vf->ops) {
-		ret = pwritev(vf->fd, iov, iovcnt, pos + vf->offset);
-		if (ret < 0)
-			return -errno;
-		return ret;
-	}
-#endif
-	if (vf->ops && vf->ops->pwritev)
-		return vf->ops->pwritev(vf, iov, iovcnt, pos);
-	written = 0;
-	for (i = 0; i < iovcnt; ++i) {
-		ret = erofs_io_pwrite(vf, iov[i].iov_base, pos, iov[i].iov_len);
-		if (ret < iov[i].iov_len) {
-			if (ret < 0)
-				return ret;
-			return written + ret;
-		}
-		written += iov[i].iov_len;
-		pos += iov[i].iov_len;
-	}
 	return written;
 }
 

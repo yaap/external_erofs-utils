@@ -61,7 +61,6 @@ struct erofs_buffer_head;
 struct erofs_bufmgr;
 
 struct erofs_device_info {
-	char *src_path;
 	u8 tag[64];
 	u32 blocks;
 	u32 mapped_blkaddr;
@@ -82,9 +81,6 @@ struct erofs_xattr_prefix_item {
 #define EROFS_PACKED_NID_UNALLOCATED	-1
 
 struct erofs_mkfs_dfops;
-struct erofs_packed_inode;
-struct z_erofs_mgr;
-
 struct erofs_sb_info {
 	struct erofs_sb_lz4_info lz4;
 	struct erofs_device_info *devs;
@@ -143,9 +139,6 @@ struct erofs_sb_info {
 	struct erofs_mkfs_dfops *mkfs_dfops;
 #endif
 	struct erofs_bufmgr *bmgr;
-	struct z_erofs_mgr *zmgr;
-	struct erofs_packed_inode *packedinode;
-	struct erofs_buffer_head *bh_devt;
 	bool useqpl;
 };
 
@@ -180,11 +173,8 @@ EROFS_FEATURE_FUNCS(xattr_prefixes, incompat, INCOMPAT_XATTR_PREFIXES)
 EROFS_FEATURE_FUNCS(sb_chksum, compat, COMPAT_SB_CHKSUM)
 EROFS_FEATURE_FUNCS(xattr_filter, compat, COMPAT_XATTR_FILTER)
 
-#define EROFS_I_EA_INITED_BIT	0
-#define EROFS_I_Z_INITED_BIT	1
-
-#define EROFS_I_EA_INITED	(1 << EROFS_I_EA_INITED_BIT)
-#define EROFS_I_Z_INITED	(1 << EROFS_I_Z_INITED_BIT)
+#define EROFS_I_EA_INITED	(1 << 0)
+#define EROFS_I_Z_INITED	(1 << 1)
 
 struct erofs_diskbuf;
 
@@ -198,7 +188,7 @@ struct erofs_inode {
 
 	union {
 		/* (erofsfuse) runtime flags */
-		erofs_atomic_t flags;
+		unsigned int flags;
 
 		/* (mkfs.erofs) next pointer for directory dumping */
 		struct erofs_inode *next_dirwrite;
@@ -263,6 +253,7 @@ struct erofs_inode {
 	unsigned int eof_tailrawsize;
 
 	union {
+		void *compressmeta;
 		void *chunkindexes;
 		struct {
 			uint16_t z_advise;
@@ -276,13 +267,10 @@ struct erofs_inode {
 			union {
 				unsigned int z_idataoff;
 				erofs_off_t fragmentoff;
-				void *fragment;
 			};
 #define z_idata_size	idata_size
 		};
 	};
-	void *compressmeta;
-
 #ifdef WITH_ANDROID
 	uint64_t capabilities;
 #endif
@@ -301,14 +289,22 @@ static inline bool is_inode_layout_compression(struct erofs_inode *inode)
 	return erofs_inode_is_data_compressed(inode->datalayout);
 }
 
-static inline unsigned int erofs_inode_version(unsigned int ifmt)
+static inline unsigned int erofs_bitrange(unsigned int value, unsigned int bit,
+					  unsigned int bits)
 {
-	return (ifmt >> EROFS_I_VERSION_BIT) & EROFS_I_VERSION_MASK;
+	return (value >> bit) & ((1 << bits) - 1);
 }
 
-static inline unsigned int erofs_inode_datalayout(unsigned int ifmt)
+static inline unsigned int erofs_inode_version(unsigned int value)
 {
-	return (ifmt >> EROFS_I_DATALAYOUT_BIT) & EROFS_I_DATALAYOUT_MASK;
+	return erofs_bitrange(value, EROFS_I_VERSION_BIT,
+			      EROFS_I_VERSION_BITS);
+}
+
+static inline unsigned int erofs_inode_datalayout(unsigned int value)
+{
+	return erofs_bitrange(value, EROFS_I_DATALAYOUT_BIT,
+			      EROFS_I_DATALAYOUT_BITS);
 }
 
 static inline struct erofs_inode *erofs_parent_inode(struct erofs_inode *inode)
@@ -318,17 +314,15 @@ static inline struct erofs_inode *erofs_parent_inode(struct erofs_inode *inode)
 
 #define IS_ROOT(x)	((x) == erofs_parent_inode(x))
 
-#define EROFS_DENTRY_NAME_ALIGNMENT	4
 struct erofs_dentry {
 	struct list_head d_child;	/* child of parent list */
 	union {
 		struct erofs_inode *inode;
 		erofs_nid_t nid;
 	};
-	u8 namelen;
+	char name[EROFS_NAME_LEN];
 	u8 type;
 	bool validnid;
-	char name[];
 };
 
 static inline bool is_dot_dotdot_len(const char *name, unsigned int len)
@@ -376,11 +370,9 @@ enum {
 /* The length of extent is full */
 #define EROFS_MAP_FULL_MAPPED	(1 << BH_FullMapped)
 /* Located in the special packed inode */
-#define __EROFS_MAP_FRAGMENT	(1 << BH_Fragment)
+#define EROFS_MAP_FRAGMENT	(1 << BH_Fragment)
 /* The extent refers to partial decompressed data */
 #define EROFS_MAP_PARTIAL_REF	(1 << BH_Partialref)
-
-#define EROFS_MAP_FRAGMENT	(EROFS_MAP_MAPPED | __EROFS_MAP_FRAGMENT)
 
 struct erofs_map_blocks {
 	char mpage[EROFS_MAX_BLOCK_SIZE];
@@ -416,12 +408,10 @@ struct erofs_map_dev {
 /* super.c */
 int erofs_read_superblock(struct erofs_sb_info *sbi);
 void erofs_put_super(struct erofs_sb_info *sbi);
-int erofs_writesb(struct erofs_sb_info *sbi, struct erofs_buffer_head *sb_bh);
+int erofs_writesb(struct erofs_sb_info *sbi, struct erofs_buffer_head *sb_bh,
+		  erofs_blk_t *blocks);
 struct erofs_buffer_head *erofs_reserve_sb(struct erofs_bufmgr *bmgr);
-int erofs_mkfs_init_devices(struct erofs_sb_info *sbi, unsigned int devices);
-int erofs_write_device_table(struct erofs_sb_info *sbi);
 int erofs_enable_sb_chksum(struct erofs_sb_info *sbi, u32 *crc);
-int erofs_superblock_csum_verify(struct erofs_sb_info *sbi);
 
 /* namei.c */
 int erofs_read_inode_from_disk(struct erofs_inode *vi);
@@ -468,6 +458,7 @@ int erofs_getxattr(struct erofs_inode *vi, const char *name, char *buffer,
 int erofs_listxattr(struct erofs_inode *vi, char *buffer, size_t buffer_size);
 
 /* zmap.c */
+int z_erofs_fill_inode(struct erofs_inode *vi);
 int z_erofs_map_blocks_iter(struct erofs_inode *vi,
 			    struct erofs_map_blocks *map, int flags);
 
@@ -513,9 +504,6 @@ static inline int erofs_blk_read(struct erofs_sb_info *sbi, int device_id,
 	return erofs_dev_read(sbi, device_id, buf, erofs_pos(sbi, start),
 			      erofs_pos(sbi, nblocks));
 }
-
-/* vmdk.c */
-int erofs_dump_vmdk_desc(FILE *f, struct erofs_sb_info *sbi);
 
 #ifdef EUCLEAN
 #define EFSCORRUPTED	EUCLEAN		/* Filesystem is corrupted */

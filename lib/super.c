@@ -76,13 +76,13 @@ int erofs_read_superblock(struct erofs_sb_info *sbi)
 {
 	u8 data[EROFS_MAX_BLOCK_SIZE];
 	struct erofs_super_block *dsb;
-	int read, ret;
+	int ret;
 
-	read = erofs_io_pread(&sbi->bdev, data, 0, EROFS_MAX_BLOCK_SIZE);
-	if (read < EROFS_SUPER_END) {
-		ret = read < 0 ? read : -EIO;
+	sbi->blkszbits = ilog2(EROFS_MAX_BLOCK_SIZE);
+	ret = erofs_blk_read(sbi, 0, data, 0, erofs_blknr(sbi, sizeof(data)));
+	if (ret < 0) {
 		erofs_err("cannot read erofs superblock: %d", ret);
-		return ret;
+		return -EIO;
 	}
 	dsb = (struct erofs_super_block *)(data + EROFS_SUPER_OFFSET);
 
@@ -105,8 +105,9 @@ int erofs_read_superblock(struct erofs_sb_info *sbi)
 	}
 
 	sbi->sb_size = 128 + dsb->sb_extslots * EROFS_SB_EXTSLOT_SIZE;
-	if (sbi->sb_size > read - EROFS_SUPER_OFFSET) {
-		erofs_err("invalid sb_extslots %u", dsb->sb_extslots);
+	if (sbi->sb_size > (1 << sbi->blkszbits) - EROFS_SUPER_OFFSET) {
+		erofs_err("invalid sb_extslots %u (more than a fs block)",
+			  dsb->sb_extslots);
 		return -EINVAL;
 	}
 	sbi->primarydevice_blocks = le32_to_cpu(dsb->blocks);
@@ -144,11 +145,6 @@ int erofs_read_superblock(struct erofs_sb_info *sbi)
 void erofs_put_super(struct erofs_sb_info *sbi)
 {
 	if (sbi->devs) {
-		int i;
-
-		DBG_BUGON(!sbi->extra_devices);
-		for (i = 0; i < sbi->extra_devices; ++i)
-			free(sbi->devs[i].src_path);
 		free(sbi->devs);
 		sbi->devs = NULL;
 	}
@@ -159,7 +155,8 @@ void erofs_put_super(struct erofs_sb_info *sbi)
 	}
 }
 
-int erofs_writesb(struct erofs_sb_info *sbi, struct erofs_buffer_head *sb_bh)
+int erofs_writesb(struct erofs_sb_info *sbi, struct erofs_buffer_head *sb_bh,
+		  erofs_blk_t *blocks)
 {
 	struct erofs_super_block sb = {
 		.magic     = cpu_to_le32(EROFS_SUPER_MAGIC_V1),
@@ -183,7 +180,8 @@ int erofs_writesb(struct erofs_sb_info *sbi, struct erofs_buffer_head *sb_bh)
 	char *buf;
 	int ret;
 
-	sb.blocks       = cpu_to_le32(sbi->primarydevice_blocks);
+	*blocks         = erofs_mapbh(sbi->bmgr, NULL);
+	sb.blocks       = cpu_to_le32(*blocks);
 	memcpy(sb.uuid, sbi->uuid, sizeof(sb.uuid));
 	memcpy(sb.volume_name, sbi->volume_name, sizeof(sb.volume_name));
 
@@ -213,7 +211,7 @@ struct erofs_buffer_head *erofs_reserve_sb(struct erofs_bufmgr *bmgr)
 	struct erofs_buffer_head *bh;
 	int err;
 
-	bh = erofs_balloc(bmgr, META, 0, 0);
+	bh = erofs_balloc(bmgr, META, 0, 0, 0);
 	if (IS_ERR(bh)) {
 		erofs_err("failed to allocate super: %s",
 			  erofs_strerror(PTR_ERR(bh)));
@@ -246,22 +244,19 @@ int erofs_enable_sb_chksum(struct erofs_sb_info *sbi, u32 *crc)
 	unsigned int len;
 	struct erofs_super_block *sb;
 
-	/*
-	 * skip the first 1024 bytes, to allow for the installation
-	 * of x86 boot sectors and other oddities.
-	 */
-	if (erofs_blksiz(sbi) > EROFS_SUPER_OFFSET)
-		len = erofs_blksiz(sbi) - EROFS_SUPER_OFFSET;
-	else
-		len = erofs_blksiz(sbi);
-	ret = erofs_dev_read(sbi, 0, buf, EROFS_SUPER_OFFSET, len);
+	ret = erofs_blk_read(sbi, 0, buf, 0, erofs_blknr(sbi, EROFS_SUPER_END) + 1);
 	if (ret) {
 		erofs_err("failed to read superblock to set checksum: %s",
 			  erofs_strerror(ret));
 		return ret;
 	}
 
-	sb = (struct erofs_super_block *)buf;
+	/*
+	 * skip the first 1024 bytes, to allow for the installation
+	 * of x86 boot sectors and other oddities.
+	 */
+	sb = (struct erofs_super_block *)(buf + EROFS_SUPER_OFFSET);
+
 	if (le32_to_cpu(sb->magic) != EROFS_SUPER_MAGIC_V1) {
 		erofs_err("internal error: not an erofs valid image");
 		return -EFAULT;
@@ -270,111 +265,21 @@ int erofs_enable_sb_chksum(struct erofs_sb_info *sbi, u32 *crc)
 	/* turn on checksum feature */
 	sb->feature_compat = cpu_to_le32(le32_to_cpu(sb->feature_compat) |
 					 EROFS_FEATURE_COMPAT_SB_CHKSUM);
+	if (erofs_blksiz(sbi) > EROFS_SUPER_OFFSET)
+		len = erofs_blksiz(sbi) - EROFS_SUPER_OFFSET;
+	else
+		len = erofs_blksiz(sbi);
 	*crc = erofs_crc32c(~0, (u8 *)sb, len);
 
 	/* set up checksum field to erofs_super_block */
 	sb->checksum = cpu_to_le32(*crc);
 
-	ret = erofs_dev_write(sbi, buf, EROFS_SUPER_OFFSET, len);
+	ret = erofs_blk_write(sbi, buf, 0, 1);
 	if (ret) {
 		erofs_err("failed to write checksummed superblock: %s",
 			  erofs_strerror(ret));
 		return ret;
 	}
-	return 0;
-}
 
-int erofs_superblock_csum_verify(struct erofs_sb_info *sbi)
-{
-	u32 len = erofs_blksiz(sbi), crc;
-	u8 buf[EROFS_MAX_BLOCK_SIZE];
-	struct erofs_super_block *sb;
-	int ret;
-
-	if (len > EROFS_SUPER_OFFSET)
-		len -= EROFS_SUPER_OFFSET;
-	ret = erofs_dev_read(sbi, 0, buf, EROFS_SUPER_OFFSET, len);
-	if (ret) {
-		erofs_err("failed to read superblock to calculate sbcsum: %d",
-			  ret);
-		return -1;
-	}
-
-	sb = (struct erofs_super_block *)buf;
-	sb->checksum = 0;
-
-	crc = erofs_crc32c(~0, (u8 *)sb, len);
-	if (crc == sbi->checksum)
-		return 0;
-	erofs_err("invalid checksum 0x%08x, 0x%08x expected",
-		  sbi->checksum, crc);
-	return -EBADMSG;
-}
-
-int erofs_mkfs_init_devices(struct erofs_sb_info *sbi, unsigned int devices)
-{
-	struct erofs_buffer_head *bh;
-
-	if (!devices)
-		return 0;
-
-	sbi->devs = calloc(devices, sizeof(sbi->devs[0]));
-	if (!sbi->devs)
-		return -ENOMEM;
-
-	bh = erofs_balloc(sbi->bmgr, DEVT,
-			  sizeof(struct erofs_deviceslot) * devices, 0);
-	if (IS_ERR(bh)) {
-		free(sbi->devs);
-		sbi->devs = NULL;
-		return PTR_ERR(bh);
-	}
-	erofs_mapbh(NULL, bh->block);
-	bh->op = &erofs_skip_write_bhops;
-	sbi->bh_devt = bh;
-	sbi->devt_slotoff = erofs_btell(bh, false) / EROFS_DEVT_SLOT_SIZE;
-	sbi->extra_devices = devices;
-	erofs_sb_set_device_table(sbi);
-	return 0;
-}
-
-int erofs_write_device_table(struct erofs_sb_info *sbi)
-{
-	erofs_blk_t nblocks = sbi->primarydevice_blocks;
-	struct erofs_buffer_head *bh = sbi->bh_devt;
-	erofs_off_t pos;
-	unsigned int i, ret;
-
-	if (!sbi->extra_devices)
-		goto out;
-	if (!bh)
-		return -EINVAL;
-
-	pos = erofs_btell(bh, false);
-	if (pos == NULL_ADDR_UL) {
-		DBG_BUGON(1);
-		return -EINVAL;
-	}
-
-	i = 0;
-	do {
-		struct erofs_deviceslot dis = {
-			.mapped_blkaddr = cpu_to_le32(nblocks),
-			.blocks = cpu_to_le32(sbi->devs[i].blocks),
-		};
-
-		memcpy(dis.tag, sbi->devs[i].tag, sizeof(dis.tag));
-		ret = erofs_dev_write(sbi, &dis, pos, sizeof(dis));
-		if (ret)
-			return ret;
-		pos += sizeof(dis);
-		nblocks += sbi->devs[i].blocks;
-	} while (++i < sbi->extra_devices);
-
-	bh->op = &erofs_drop_directly_bhops;
-	erofs_bdrop(bh, false);
-	sbi->bh_devt = NULL;
-out:
-	sbi->total_blocks = nblocks;
 	return 0;
 }

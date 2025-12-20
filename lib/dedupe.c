@@ -6,7 +6,7 @@
 #include "erofs/dedupe.h"
 #include "erofs/print.h"
 #include "rolling_hash.h"
-#include "liberofs_xxhash.h"
+#include "xxhash.h"
 #include "sha256.h"
 
 unsigned long erofs_memcmp2(const u8 *s1, const u8 *s2,
@@ -72,8 +72,8 @@ struct z_erofs_dedupe_item {
 	u8		prefix_sha256[32];
 	u64		prefix_xxh64;
 
-	erofs_off_t	pstart;
-	unsigned int	plen;
+	erofs_blk_t	compressed_blkaddr;
+	unsigned int	compressed_blks;
 
 	int		original_length;
 	bool		partial, raw;
@@ -142,8 +142,8 @@ int z_erofs_dedupe_match(struct z_erofs_dedupe_ctx *ctx)
 			(window_size + extra < e->original_length);
 		ctx->e.raw = e->raw;
 		ctx->e.inlined = false;
-		ctx->e.pstart = e->pstart;
-		ctx->e.plen = e->plen;
+		ctx->e.blkaddr = e->compressed_blkaddr;
+		ctx->e.compressedblks = e->compressed_blks;
 		return 0;
 	}
 	return -ENOENT;
@@ -170,8 +170,8 @@ int z_erofs_dedupe_insert(struct z_erofs_inmem_extent *e,
 			window_size, true);
 	memcpy(di->extra_data, original_data + window_size,
 	       e->length - window_size);
-	di->pstart = e->pstart;
-	di->plen = e->plen;
+	di->compressed_blkaddr = e->blkaddr;
+	di->compressed_blks = e->compressedblks;
 	di->partial = e->partial;
 	di->raw = e->raw;
 
