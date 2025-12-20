@@ -41,9 +41,9 @@ static int s_getrandom(void *out, unsigned size, bool insecure)
 		ssize_t r;
 		int err;
 
-#if defined(HAVE_SYS_RANDOM_H) && defined(HAVE_GETRANDOM)
+#ifdef HAVE_SYS_RANDOM_H
 		r = getrandom(out, size, flags);
-#elif defined(__linux__) && defined(__NR_getrandom)
+#elif defined(__NR_getrandom)
 		r = (ssize_t)syscall(__NR_getrandom, out, size, flags);
 #else
 		r = -1;

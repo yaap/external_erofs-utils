@@ -26,7 +26,6 @@ struct erofsdump_cfg {
 	bool show_superblock;
 	bool show_statistics;
 	bool show_subdirectories;
-	bool show_file_content;
 	erofs_nid_t nid;
 	const char *inode_path;
 };
@@ -81,7 +80,6 @@ static struct option long_options[] = {
 	{"path", required_argument, NULL, 4},
 	{"ls", no_argument, NULL, 5},
 	{"offset", required_argument, NULL, 6},
-	{"cat", no_argument, NULL, 7},
 	{0, 0, 0, 0},
 };
 
@@ -125,7 +123,6 @@ static void usage(int argc, char **argv)
 		" -s              show information about superblock\n"
 		" --device=X      specify an extra device to be used together\n"
 		" --ls            show directory contents (INODE required)\n"
-		" --cat           show file contents (INODE required)\n"
 		" --nid=#         show the target inode info of nid #\n"
 		" --offset=#      skip # bytes at the beginning of IMAGE\n"
 		" --path=X        show the target inode info of path X\n",
@@ -188,9 +185,6 @@ static int erofsdump_parse_options_cfg(int argc, char **argv)
 				erofs_err("invalid disk offset %s", optarg);
 				return -EINVAL;
 			}
-			break;
-		case 7:
-			dumpcfg.show_file_content = true;
 			break;
 		default:
 			return -EINVAL;
@@ -359,6 +353,14 @@ static int erofsdump_readdir(struct erofs_dir_context *ctx)
 	return 0;
 }
 
+static int erofsdump_map_blocks(struct erofs_inode *inode,
+		struct erofs_map_blocks *map, int flags)
+{
+	if (erofs_inode_is_data_compressed(inode->datalayout))
+		return z_erofs_map_blocks_iter(inode, map, flags);
+	return erofs_map_blocks(inode, map, flags);
+}
+
 static void erofsdump_show_fileinfo(bool show_extent)
 {
 	const char *ext_fmt[] = {
@@ -453,7 +455,8 @@ static void erofsdump_show_fileinfo(bool show_extent)
 	while (map.m_la < inode.i_size) {
 		struct erofs_map_dev mdev;
 
-		err = erofs_map_blocks(&inode, &map, EROFS_GET_BLOCKS_FIEMAP);
+		err = erofsdump_map_blocks(&inode, &map,
+				EROFS_GET_BLOCKS_FIEMAP);
 		if (err) {
 			erofs_err("failed to get file blocks range");
 			return;
@@ -469,7 +472,7 @@ static void erofsdump_show_fileinfo(bool show_extent)
 			return;
 		}
 
-		if (map.m_flags & __EROFS_MAP_FRAGMENT)
+		if (map.m_flags & EROFS_MAP_FRAGMENT)
 			fprintf(stdout, ext_fmt[!!mdev.m_deviceid],
 				extent_count++,
 				map.m_la, map.m_la + map.m_llen, map.m_llen,
@@ -669,56 +672,6 @@ static void erofsdump_show_superblock(void)
 			uuid_str);
 }
 
-static void erofsdump_show_file_content(void)
-{
-	int err;
-	struct erofs_inode inode = { .sbi = &g_sbi, .nid = dumpcfg.nid };
-	size_t buffer_size;
-	char *buffer_ptr;
-	erofs_off_t pending_size;
-	erofs_off_t read_offset;
-	erofs_off_t read_size;
-
-	if (dumpcfg.inode_path) {
-		err = erofs_ilookup(dumpcfg.inode_path, &inode);
-		if (err) {
-			erofs_err("read inode failed @ %s", dumpcfg.inode_path);
-			return;
-		}
-	} else {
-		err = erofs_read_inode_from_disk(&inode);
-		if (err) {
-			erofs_err("read inode failed @ nid %llu", inode.nid | 0ULL);
-			return;
-		}
-	}
-
-	buffer_size = erofs_blksiz(inode.sbi);
-	buffer_ptr = malloc(buffer_size);
-	if (!buffer_ptr) {
-		erofs_err("buffer allocation failed @ nid %llu", inode.nid | 0ULL);
-		return;
-	}
-
-	pending_size = inode.i_size;
-	read_offset = 0;
-	while (pending_size > 0) {
-		read_size = pending_size > buffer_size? buffer_size: pending_size;
-		err = erofs_pread(&inode, buffer_ptr, read_size, read_offset);
-		if (err) {
-			erofs_err("read file failed @ nid %llu", inode.nid | 0ULL);
-			goto out;
-		}
-		pending_size -= read_size;
-		read_offset += read_size;
-		fwrite(buffer_ptr, read_size, 1, stdout);
-	}
-	fflush(stdout);
-
-out:
-	free(buffer_ptr);
-}
-
 int main(int argc, char **argv)
 {
 	int err;
@@ -740,15 +693,6 @@ int main(int argc, char **argv)
 	err = erofs_read_superblock(&g_sbi);
 	if (err) {
 		erofs_err("failed to read superblock");
-		goto exit_dev_close;
-	}
-
-	if (dumpcfg.show_file_content) {
-		if (dumpcfg.show_superblock || dumpcfg.show_statistics || dumpcfg.show_subdirectories) {
-			fprintf(stderr, "The '--cat' flag is incompatible with '-S', '-e', '-s' and '--ls'.\n");
-			goto exit_dev_close;
-		}
-		erofsdump_show_file_content();
 		goto exit_dev_close;
 	}
 

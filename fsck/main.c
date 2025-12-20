@@ -16,17 +16,10 @@
 #include "erofs/dir.h"
 #include "erofs/xattr.h"
 #include "../lib/compressor.h"
-#include "erofs/fragments.h"
 
 static int erofsfsck_check_inode(erofs_nid_t pnid, erofs_nid_t nid);
 
-struct erofsfsck_dirstack {
-	erofs_nid_t dirs[PATH_MAX];
-	int top;
-};
-
 struct erofsfsck_cfg {
-	struct erofsfsck_dirstack dirstack;
 	u64 physical_blocks;
 	u64 logical_blocks;
 	char *extract_path;
@@ -41,7 +34,6 @@ struct erofsfsck_cfg {
 	bool preserve_owner;
 	bool preserve_perms;
 	bool dump_xattrs;
-	bool nosbcrc;
 };
 static struct erofsfsck_cfg fsckcfg;
 
@@ -61,7 +53,6 @@ static struct option long_options[] = {
 	{"offset", required_argument, 0, 12},
 	{"xattrs", no_argument, 0, 13},
 	{"no-xattrs", no_argument, 0, 14},
-	{"no-sbcrc", no_argument, 0, 512},
 	{0, 0, 0, 0},
 };
 
@@ -112,7 +103,6 @@ static void usage(int argc, char **argv)
 		" --extract[=X]          check if all files are well encoded, optionally\n"
 		"                        extract to X\n"
 		" --offset=#             skip # bytes at the beginning of IMAGE\n"
-		" --no-sbcrc             bypass the superblock checksum verification\n"
 		" --[no-]xattrs          whether to dump extended attributes (default off)\n"
 		"\n"
 		" -a, -A, -y             no-op, for compatibility with fsck of other filesystems\n"
@@ -247,9 +237,6 @@ static int erofsfsck_parse_options_cfg(int argc, char **argv)
 		case 14:
 			fsckcfg.dump_xattrs = false;
 			break;
-		case 512:
-			fsckcfg.nosbcrc = true;
-			break;
 		default:
 			return -EINVAL;
 		}
@@ -312,12 +299,6 @@ static void erofsfsck_set_attributes(struct erofs_inode *inode, char *path)
 #endif
 		erofs_warn("failed to set times: %s", path);
 
-	if (fsckcfg.preserve_owner) {
-		ret = lchown(path, inode->i_uid, inode->i_gid);
-		if (ret < 0)
-			erofs_warn("failed to change ownership: %s", path);
-	}
-
 	if (!S_ISLNK(inode->i_mode)) {
 		if (fsckcfg.preserve_perms)
 			ret = chmod(path, inode->i_mode);
@@ -326,6 +307,41 @@ static void erofsfsck_set_attributes(struct erofs_inode *inode, char *path)
 		if (ret < 0)
 			erofs_warn("failed to set permissions: %s", path);
 	}
+
+	if (fsckcfg.preserve_owner) {
+		ret = lchown(path, inode->i_uid, inode->i_gid);
+		if (ret < 0)
+			erofs_warn("failed to change ownership: %s", path);
+	}
+}
+
+static int erofs_check_sb_chksum(void)
+{
+#ifndef FUZZING
+	u8 buf[EROFS_MAX_BLOCK_SIZE];
+	u32 crc;
+	struct erofs_super_block *sb;
+	int ret;
+
+	ret = erofs_blk_read(&g_sbi, 0, buf, 0, 1);
+	if (ret) {
+		erofs_err("failed to read superblock to check checksum: %d",
+			  ret);
+		return -1;
+	}
+
+	sb = (struct erofs_super_block *)(buf + EROFS_SUPER_OFFSET);
+	sb->checksum = 0;
+
+	crc = erofs_crc32c(~0, (u8 *)sb, erofs_blksiz(&g_sbi) - EROFS_SUPER_OFFSET);
+	if (crc != g_sbi.checksum) {
+		erofs_err("superblock chksum doesn't match: saved(%08xh) calculated(%08xh)",
+			  g_sbi.checksum, crc);
+		fsckcfg.corrupted = true;
+		return -1;
+	}
+#endif
+	return 0;
 }
 
 static int erofs_verify_xattr(struct erofs_inode *inode)
@@ -501,7 +517,6 @@ static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd)
 	struct erofs_map_blocks map = {
 		.index = UINT_MAX,
 	};
-	bool needdecode = fsckcfg.check_decomp && !erofs_is_packed_inode(inode);
 	int ret = 0;
 	bool compressed;
 	erofs_off_t pos = 0;
@@ -512,12 +527,31 @@ static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd)
 	erofs_dbg("verify data chunk of nid(%llu): type(%d)",
 		  inode->nid | 0ULL, inode->datalayout);
 
-	compressed = erofs_inode_is_data_compressed(inode->datalayout);
+	switch (inode->datalayout) {
+	case EROFS_INODE_FLAT_PLAIN:
+	case EROFS_INODE_FLAT_INLINE:
+	case EROFS_INODE_CHUNK_BASED:
+		compressed = false;
+		break;
+	case EROFS_INODE_COMPRESSED_FULL:
+	case EROFS_INODE_COMPRESSED_COMPACT:
+		compressed = true;
+		break;
+	default:
+		erofs_err("unknown datalayout");
+		return -EINVAL;
+	}
+
 	while (pos < inode->i_size) {
 		unsigned int alloc_rawsize;
 
 		map.m_la = pos;
-		ret = erofs_map_blocks(inode, &map, EROFS_GET_BLOCKS_FIEMAP);
+		if (compressed)
+			ret = z_erofs_map_blocks_iter(inode, &map,
+					EROFS_GET_BLOCKS_FIEMAP);
+		else
+			ret = erofs_map_blocks(inode, &map,
+					EROFS_GET_BLOCKS_FIEMAP);
 		if (ret)
 			goto out;
 
@@ -536,7 +570,7 @@ static int erofs_verify_inode_data(struct erofs_inode *inode, int outfd)
 		pos += map.m_llen;
 
 		/* should skip decomp? */
-		if (map.m_la >= inode->i_size || !needdecode)
+		if (map.m_la >= inode->i_size || !fsckcfg.check_decomp)
 			continue;
 
 		if (outfd >= 0 && !(map.m_flags & EROFS_MAP_MAPPED)) {
@@ -902,7 +936,7 @@ static int erofsfsck_extract_inode(struct erofs_inode *inode)
 	int ret;
 	char *oldpath;
 
-	if (!fsckcfg.extract_path || erofs_is_packed_inode(inode)) {
+	if (!fsckcfg.extract_path) {
 verify:
 		/* verify data chunk layout */
 		return erofs_verify_inode_data(inode, -1);
@@ -923,6 +957,8 @@ verify:
 		ret = erofs_extract_dir(inode);
 		break;
 	case S_IFREG:
+		if (erofs_is_packed_inode(inode))
+			goto verify;
 		ret = erofs_extract_file(inode);
 		break;
 	case S_IFLNK:
@@ -950,10 +986,13 @@ verify:
 
 static int erofsfsck_check_inode(erofs_nid_t pnid, erofs_nid_t nid)
 {
-	int ret, i;
-	struct erofs_inode inode = {.sbi = &g_sbi, .nid = nid};
+	int ret;
+	struct erofs_inode inode;
 
 	erofs_dbg("check inode: nid(%llu)", nid | 0ULL);
+
+	inode.nid = nid;
+	inode.sbi = &g_sbi;
 	ret = erofs_read_inode_from_disk(&inode);
 	if (ret) {
 		if (ret == -EIO)
@@ -979,6 +1018,7 @@ static int erofsfsck_check_inode(erofs_nid_t pnid, erofs_nid_t nid)
 			return ret;
 	}
 
+	/* XXXX: the dir depth should be restricted in order to avoid loops */
 	if (S_ISDIR(inode.i_mode)) {
 		struct erofs_dir_context ctx = {
 			.flags = EROFS_READDIR_VALID_PNID,
@@ -987,15 +1027,7 @@ static int erofsfsck_check_inode(erofs_nid_t pnid, erofs_nid_t nid)
 			.cb = erofsfsck_dirent_iter,
 		};
 
-		/* XXX: support the deeper cases later */
-		if (fsckcfg.dirstack.top >= ARRAY_SIZE(fsckcfg.dirstack.dirs))
-			return -ENAMETOOLONG;
-		for (i = 0; i < fsckcfg.dirstack.top; ++i)
-			if (inode.nid == fsckcfg.dirstack.dirs[i])
-				return -ELOOP;
-		fsckcfg.dirstack.dirs[fsckcfg.dirstack.top++] = pnid;
 		ret = erofs_iterate_dir(&ctx, true);
-		--fsckcfg.dirstack.top;
 	}
 
 	if (!ret && !erofs_is_packed_inode(&inode))
@@ -1043,7 +1075,6 @@ int main(int argc, char *argv[])
 
 #ifdef FUZZING
 	cfg.c_dbg_lvl = -1;
-	fsckcfg.nosbcrc = true;
 #endif
 
 	err = erofs_dev_open(&g_sbi, cfg.c_img_path, O_RDONLY);
@@ -1058,9 +1089,7 @@ int main(int argc, char *argv[])
 		goto exit_dev_close;
 	}
 
-	if (!fsckcfg.nosbcrc && erofs_sb_has_sb_chksum(&g_sbi) &&
-	    erofs_superblock_csum_verify(&g_sbi)) {
-		fsckcfg.corrupted = true;
+	if (erofs_sb_has_sb_chksum(&g_sbi) && erofs_check_sb_chksum()) {
 		erofs_err("failed to verify superblock checksum");
 		goto exit_put_super;
 	}
@@ -1069,17 +1098,10 @@ int main(int argc, char *argv[])
 		erofsfsck_hardlink_init();
 
 	if (erofs_sb_has_fragments(&g_sbi) && g_sbi.packed_nid > 0) {
-		err = erofs_packedfile_init(&g_sbi, false);
-		if (err) {
-			erofs_err("failed to initialize packedfile: %s",
-				  erofs_strerror(err));
-			goto exit_hardlink;
-		}
-
 		err = erofsfsck_check_inode(g_sbi.packed_nid, g_sbi.packed_nid);
 		if (err) {
 			erofs_err("failed to verify packed file");
-			goto exit_packedinode;
+			goto exit_hardlink;
 		}
 	}
 
@@ -1105,8 +1127,6 @@ int main(int argc, char *argv[])
 		}
 	}
 
-exit_packedinode:
-	erofs_packedfile_exit(&g_sbi);
 exit_hardlink:
 	if (fsckcfg.extract_path)
 		erofsfsck_hardlink_exit();

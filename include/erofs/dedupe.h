@@ -13,8 +13,8 @@ extern "C"
 #include "internal.h"
 
 struct z_erofs_inmem_extent {
-	erofs_off_t pstart;
-	unsigned int plen;
+	erofs_blk_t blkaddr;
+	unsigned int compressedblks;
 	unsigned int length;
 	bool raw, partial, inlined;
 };
@@ -31,14 +31,6 @@ int z_erofs_dedupe_insert(struct z_erofs_inmem_extent *e,
 void z_erofs_dedupe_commit(bool drop);
 int z_erofs_dedupe_init(unsigned int wsiz);
 void z_erofs_dedupe_exit(void);
-
-int z_erofs_dedupe_ext_insert(struct z_erofs_inmem_extent *e,
-			      u64 hash);
-erofs_off_t z_erofs_dedupe_ext_match(struct erofs_sb_info *sbi,
-			u8 *encoded, unsigned int size, bool raw, u64 *hash);
-void z_erofs_dedupe_ext_commit(bool drop);
-int z_erofs_dedupe_ext_init(void);
-void z_erofs_dedupe_ext_exit(void);
 
 #ifdef __cplusplus
 }

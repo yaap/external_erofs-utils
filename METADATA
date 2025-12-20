@@ -7,16 +7,16 @@ description: "EROFS Utilities"
 third_party {
   license_type: RESTRICTED
   security {
-    tag: "NVD-CPE2.3:cpe:/a:erofs-utils_project:erofs-utils:1.8.10"
+    tag: "NVD-CPE2.3:cpe:/a:erofs-utils_project:erofs-utils:1.8.3"
   }
   last_upgrade_date {
-    year: 2025
+    year: 2024
     month: 12
-    day: 11
+    day: 18
   }
   identifier {
     type: "Git"
     value: "https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git"
-    version: "v1.8.10"
+    version: "v1.8.3"
   }
 }

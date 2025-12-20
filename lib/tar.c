@@ -283,7 +283,7 @@ static long long tarerofs_otoi(const char *ptr, int len)
 	inp[len] = '\0';
 
 	errno = 0;
-	val = strtoll(inp, &endp, 8);
+	val = strtol(inp, &endp, 8);
 	if ((*endp == '\0' && endp == inp) |
 	    (*endp != '\0' && *endp != ' '))
 		errno = EINVAL;
@@ -292,17 +292,16 @@ static long long tarerofs_otoi(const char *ptr, int len)
 
 static long long tarerofs_parsenum(const char *ptr, int len)
 {
-	errno = 0;
 	/*
 	 * For fields containing numbers or timestamps that are out of range
 	 * for the basic format, the GNU format uses a base-256 representation
 	 * instead of an ASCII octal number.
 	 */
-	if (*(char *)ptr == '\200' || *(char *)ptr == '\377') {
+	if (*(char *)ptr == '\200') {
 		long long res = 0;
 
 		while (--len)
-			res = (res << 8) | (u8)*(++ptr);
+			res = (res << 8) + (u8)*(++ptr);
 		return res;
 	}
 	return tarerofs_otoi(ptr, len);
@@ -400,27 +399,25 @@ int tarerofs_apply_xattrs(struct erofs_inode *inode, struct list_head *xattrs)
 }
 
 static const char lookup_table[65] =
-	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,";
 
 static int base64_decode(const char *src, int len, u8 *dst)
 {
 	int i, bits = 0, ac = 0;
 	const char *p;
 	u8 *cp = dst;
-	bool padding = false;
 
-	if(len && !(len % 4)) {
+	if(!(len % 4)) {
 		/* Check for and ignore any end padding */
 		if (src[len - 2] == '=' && src[len - 1] == '=')
 			len -= 2;
 		else if (src[len - 1] == '=')
 			--len;
-		padding = true;
 	}
 
 	for (i = 0; i < len; i++) {
 		p = strchr(lookup_table, src[i]);
-		if (!p || !src[i])
+		if (p == NULL || src[i] == 0)
 			return -2;
 		ac += (p - lookup_table) << bits;
 		bits += 6;
@@ -430,54 +427,9 @@ static int base64_decode(const char *src, int len, u8 *dst)
 			bits -= 8;
 		}
 	}
-	if (ac) {
-		if (padding || ac > 0xff)
-			return -1;
-		else
-			*cp++ = ac & 0xff;
-	}
+	if (ac)
+		return -1;
 	return cp - dst;
-}
-
-static int tohex(int c)
-{
-	if (c >= '0' && c <= '9')
-		return c - '0';
-	else if (c >= 'A' && c <= 'F')
-		return c - 'A' + 10;
-	else if (c >= 'a' && c <= 'f')
-		return c - 'a' + 10;
-	return -1;
-}
-
-static unsigned int url_decode(char *str, unsigned int len)
-{
-	const char *s = str;
-	char *d = str;
-	int d1, d2;
-
-	for (; len && *s != '\0' && *s != '%'; ++d, ++s, --len);
-	if (!len || *s == '\0')
-		return d - str;
-
-	while (len && *s != '\0') {
-		if (*s == '%' && len > 2) {
-			/* Try to convert % escape */
-			d1 = tohex(s[1]), d2 = tohex(s[2]);
-
-			/* Look good, consume three chars */
-			if (d1 >= 0 && d2 >= 0) {
-				s += 3;
-				len -= 3;
-				*d++ = (d1 << 4) | d2;
-				continue;
-			}
-			/* Otherwise, treat '%' as normal char */
-		}
-		*d++ = *s++;
-		--len;
-	}
-	return d - str;
 }
 
 int tarerofs_parse_pax_header(struct erofs_iostream *ios,
@@ -496,7 +448,7 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 		goto out;
 
 	while (p < buf + size) {
-		char *kv, *key, *value;
+		char *kv, *value;
 		int len, n;
 		/* extended records are of the format: "LEN NAME=VALUE\n" */
 		ret = sscanf(p, "%d %n", &len, &n);
@@ -579,7 +531,8 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 				eh->use_gid = true;
 			} else if (!strncmp(kv, "SCHILY.xattr.",
 				   sizeof("SCHILY.xattr.") - 1)) {
-				key = kv + sizeof("SCHILY.xattr.") - 1;
+				char *key = kv + sizeof("SCHILY.xattr.") - 1;
+
 				--len; /* p[-1] == '\0' */
 				ret = tarerofs_insert_xattr(&eh->xattrs, key,
 						value - key - 1,
@@ -588,10 +541,9 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 					goto out;
 			} else if (!strncmp(kv, "LIBARCHIVE.xattr.",
 				   sizeof("LIBARCHIVE.xattr.") - 1)) {
-				int namelen;
-
+				char *key;
 				key = kv + sizeof("LIBARCHIVE.xattr.") - 1;
-				namelen = url_decode(key, value - key - 1);
+
 				--len; /* p[-1] == '\0' */
 				ret = base64_decode(value, len - (value - kv),
 						    (u8 *)value);
@@ -600,13 +552,9 @@ int tarerofs_parse_pax_header(struct erofs_iostream *ios,
 					goto out;
 				}
 
-				if (namelen != value - key - 1) {
-					key[namelen] = '=';
-					memmove(key + namelen + 1, value, ret);
-					value = key + namelen + 1;
-				}
 				ret = tarerofs_insert_xattr(&eh->xattrs, key,
-						namelen, namelen + 1 + ret, false);
+						value - key - 1,
+						value - key + ret, false);
 				if (ret)
 					goto out;
 			} else {
@@ -711,7 +659,6 @@ int tarerofs_parse_tar(struct erofs_inode *root, struct erofs_tarfile *tar)
 	struct erofs_sb_info *sbi = root->sbi;
 	bool whout, opq, e = false;
 	struct stat st;
-	mode_t mode;
 	erofs_off_t tar_offset, dataoff;
 
 	struct tar_header *th;
@@ -804,12 +751,42 @@ out_eot:
 		goto out;
 	}
 
+	st.st_mode = tarerofs_otoi(th->mode, sizeof(th->mode));
+	if (errno)
+		goto invalid_tar;
+
+	if (eh.use_uid) {
+		st.st_uid = eh.st.st_uid;
+	} else {
+		st.st_uid = tarerofs_parsenum(th->uid, sizeof(th->uid));
+		if (errno)
+			goto invalid_tar;
+	}
+
+	if (eh.use_gid) {
+		st.st_gid = eh.st.st_gid;
+	} else {
+		st.st_gid = tarerofs_parsenum(th->gid, sizeof(th->gid));
+		if (errno)
+			goto invalid_tar;
+	}
+
 	if (eh.use_size) {
 		st.st_size = eh.st.st_size;
 	} else {
 		st.st_size = tarerofs_parsenum(th->size, sizeof(th->size));
 		if (errno)
 			goto invalid_tar;
+	}
+
+	if (eh.use_mtime) {
+		st.st_mtime = eh.st.st_mtime;
+		ST_MTIM_NSEC_SET(&st, ST_MTIM_NSEC(&eh.st));
+	} else {
+		st.st_mtime = tarerofs_parsenum(th->mtime, sizeof(th->mtime));
+		if (errno)
+			goto invalid_tar;
+		ST_MTIM_NSEC_SET(&st, 0);
 	}
 
 	if (th->typeflag <= '7' && !eh.path) {
@@ -827,41 +804,34 @@ out_eot:
 		memcpy(path + j, th->name, sizeof(th->name));
 		path[j + sizeof(th->name)] = '\0';
 		j = strlen(path);
-		if (__erofs_unlikely(!j)) {
-			erofs_info("substituting '.' for empty filename");
-			path[0] = '.';
-			path[1] = '\0';
-		} else {
-			while (path[j - 1] == '/')
-				path[--j] = '\0';
-		}
+		while (path[j - 1] == '/')
+			path[--j] = '\0';
 	}
 
 	dataoff = tar->offset;
 	tar->offset += st.st_size;
-	st.st_mode = 0;
 	switch(th->typeflag) {
 	case '0':
 	case '7':
 	case '1':
-		st.st_mode = S_IFREG;
+		st.st_mode |= S_IFREG;
 		if (tar->headeronly_mode || tar->ddtaridx_mode)
 			tar->offset -= st.st_size;
 		break;
 	case '2':
-		st.st_mode = S_IFLNK;
+		st.st_mode |= S_IFLNK;
 		break;
 	case '3':
-		st.st_mode = S_IFCHR;
+		st.st_mode |= S_IFCHR;
 		break;
 	case '4':
-		st.st_mode = S_IFBLK;
+		st.st_mode |= S_IFBLK;
 		break;
 	case '5':
-		st.st_mode = S_IFDIR;
+		st.st_mode |= S_IFDIR;
 		break;
 	case '6':
-		st.st_mode = S_IFIFO;
+		st.st_mode |= S_IFIFO;
 		break;
 	case 'g':
 		ret = tarerofs_parse_pax_header(&tar->ios, &tar->global,
@@ -904,40 +874,6 @@ out_eot:
 		(void)erofs_iostream_lskip(&tar->ios, st.st_size);
 		ret = 0;
 		goto out;
-	}
-
-	mode = tarerofs_otoi(th->mode, sizeof(th->mode));
-	if (errno)
-		goto invalid_tar;
-	if (__erofs_unlikely(mode & S_IFMT) &&
-	    (mode & S_IFMT) != (st.st_mode & S_IFMT))
-		erofs_warn("invalid ustar mode %05o @ %llu", mode, tar_offset);
-	st.st_mode |= mode & ~S_IFMT;
-
-	if (eh.use_uid) {
-		st.st_uid = eh.st.st_uid;
-	} else {
-		st.st_uid = tarerofs_parsenum(th->uid, sizeof(th->uid));
-		if (errno)
-			goto invalid_tar;
-	}
-
-	if (eh.use_gid) {
-		st.st_gid = eh.st.st_gid;
-	} else {
-		st.st_gid = tarerofs_parsenum(th->gid, sizeof(th->gid));
-		if (errno)
-			goto invalid_tar;
-	}
-
-	if (eh.use_mtime) {
-		st.st_mtime = eh.st.st_mtime;
-		ST_MTIM_NSEC_SET(&st, ST_MTIM_NSEC(&eh.st));
-	} else {
-		st.st_mtime = tarerofs_parsenum(th->mtime, sizeof(th->mtime));
-		if (errno)
-			goto invalid_tar;
-		ST_MTIM_NSEC_SET(&st, 0);
 	}
 
 	st.st_rdev = 0;

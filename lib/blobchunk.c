@@ -9,7 +9,6 @@
 #include "erofs/blobchunk.h"
 #include "erofs/block_list.h"
 #include "erofs/cache.h"
-#include "liberofs_private.h"
 #include "sha256.h"
 #include <unistd.h>
 
@@ -28,9 +27,11 @@ struct erofs_blobchunk {
 };
 
 static struct hashmap blob_hashmap;
-static int blobfile = -1;
+static FILE *blobfile;
 static erofs_blk_t remapped_base;
 static erofs_off_t datablob_size;
+static bool multidev;
+static struct erofs_buffer_head *bh_devt;
 struct erofs_blobchunk erofs_holechunk = {
 	.blkaddr = EROFS_NULL_ADDR,
 };
@@ -85,7 +86,7 @@ static struct erofs_blobchunk *erofs_blob_getchunk(struct erofs_sb_info *sbi,
 
 	chunk->chunksize = chunksize;
 	memcpy(chunk->sha256, sha256, sizeof(sha256));
-	blkpos = lseek(blobfile, 0, SEEK_CUR);
+	blkpos = ftell(blobfile);
 	DBG_BUGON(erofs_blkoff(sbi, blkpos));
 
 	if (sbi->extra_devices)
@@ -96,22 +97,18 @@ static struct erofs_blobchunk *erofs_blob_getchunk(struct erofs_sb_info *sbi,
 
 	erofs_dbg("Writing chunk (%llu bytes) to %u", chunksize | 0ULL,
 		  chunk->blkaddr);
-	ret = __erofs_io_write(blobfile, buf, chunksize);
-	if (ret == chunksize) {
+	ret = fwrite(buf, chunksize, 1, blobfile);
+	if (ret == 1) {
 		padding = erofs_blkoff(sbi, chunksize);
 		if (padding) {
 			padding = erofs_blksiz(sbi) - padding;
-			ret = __erofs_io_write(blobfile, zeroed, padding);
-			if (ret > 0 && ret != padding)
-				ret = -EIO;
+			ret = fwrite(zeroed, padding, 1, blobfile);
 		}
-	} else if (ret >= 0) {
-		ret = -EIO;
 	}
 
-	if (ret < 0) {
+	if (ret < 1) {
 		free(chunk);
-		return ERR_PTR(ret);
+		return ERR_PTR(-ENOSPC);
 	}
 
 	hashmap_entry_init(&chunk->ent, hash);
@@ -143,6 +140,7 @@ int erofs_blob_write_chunk_indexes(struct erofs_inode *inode,
 	erofs_blk_t extent_end, chunkblks;
 	erofs_off_t source_offset;
 	unsigned int dst, src, unit, zeroedlen;
+	bool first_extent = true;
 
 	if (inode->u.chunkformat & EROFS_CHUNK_FORMAT_INDEXES)
 		unit = sizeof(struct erofs_inode_chunk_index);
@@ -173,6 +171,11 @@ int erofs_blob_write_chunk_indexes(struct erofs_inode *inode,
 				tarerofs_blocklist_write(extent_start,
 						extent_end - extent_start,
 						source_offset, 0);
+				erofs_droid_blocklist_write_extent(inode,
+					extent_start,
+					extent_end - extent_start,
+					first_extent, false);
+				first_extent = false;
 			}
 			extent_start = idx.blkaddr;
 			source_offset = chunk->sourceoffset;
@@ -195,6 +198,11 @@ int erofs_blob_write_chunk_indexes(struct erofs_inode *inode,
 		tarerofs_blocklist_write(extent_start, extent_end - extent_start,
 					 source_offset, zeroedlen);
 	}
+	erofs_droid_blocklist_write_extent(inode, extent_start,
+			extent_start == EROFS_NULL_ADDR ?
+					0 : extent_end - extent_start,
+					   first_extent, true);
+
 	return erofs_dev_write(inode->sbi, inode->chunkindexes, off,
 			       inode->extent_isize);
 }
@@ -480,8 +488,9 @@ int erofs_mkfs_dump_blobs(struct erofs_sb_info *sbi)
 	ssize_t length, ret;
 	u64 pos_in, pos_out;
 
-	if (blobfile >= 0) {
-		length = lseek(blobfile, 0, SEEK_CUR);
+	if (blobfile) {
+		fflush(blobfile);
+		length = ftell(blobfile);
 		if (length < 0)
 			return -errno;
 
@@ -491,10 +500,32 @@ int erofs_mkfs_dump_blobs(struct erofs_sb_info *sbi)
 			datablob_size = length;
 	}
 
-	if (sbi->extra_devices)
-		return 0;
+	if (sbi->extra_devices) {
+		unsigned int i, ret;
+		erofs_blk_t nblocks;
 
-	bh = erofs_balloc(sbi->bmgr, DATA, datablob_size, 0);
+		nblocks = erofs_mapbh(sbi->bmgr, NULL);
+		pos_out = erofs_btell(bh_devt, false);
+		i = 0;
+		do {
+			struct erofs_deviceslot dis = {
+				.mapped_blkaddr = cpu_to_le32(nblocks),
+				.blocks = cpu_to_le32(sbi->devs[i].blocks),
+			};
+
+			memcpy(dis.tag, sbi->devs[i].tag, sizeof(dis.tag));
+			ret = erofs_dev_write(sbi, &dis, pos_out, sizeof(dis));
+			if (ret)
+				return ret;
+			pos_out += sizeof(dis);
+			nblocks += sbi->devs[i].blocks;
+		} while (++i < sbi->extra_devices);
+		bh_devt->op = &erofs_drop_directly_bhops;
+		erofs_bdrop(bh_devt, false);
+		return 0;
+	}
+
+	bh = erofs_balloc(sbi->bmgr, DATA, datablob_size, 0, 0);
 	if (IS_ERR(bh))
 		return PTR_ERR(bh);
 
@@ -503,11 +534,11 @@ int erofs_mkfs_dump_blobs(struct erofs_sb_info *sbi)
 	pos_out = erofs_btell(bh, false);
 	remapped_base = erofs_blknr(sbi, pos_out);
 	pos_out += sbi->bdev.offset;
-	if (blobfile >= 0) {
+	if (blobfile) {
 		pos_in = 0;
 		do {
 			length = min_t(erofs_off_t, datablob_size,  SSIZE_MAX);
-			ret = erofs_copy_file_range(blobfile, &pos_in,
+			ret = erofs_copy_file_range(fileno(blobfile), &pos_in,
 					sbi->bdev.fd, &pos_out, length);
 		} while (ret > 0 && (datablob_size -= ret));
 
@@ -534,8 +565,8 @@ void erofs_blob_exit(void)
 	struct hashmap_entry *e;
 	struct erofs_blobchunk *bc, *n;
 
-	if (blobfile >= 0)
-		close(blobfile);
+	if (blobfile)
+		fclose(blobfile);
 
 	/* Disable hashmap shrink, effectively disabling rehash.
 	 * This way we can iterate over entire hashmap efficiently
@@ -588,14 +619,43 @@ static int erofs_insert_zerochunk(erofs_off_t chunksize)
 
 int erofs_blob_init(const char *blobfile_path, erofs_off_t chunksize)
 {
-	if (!blobfile_path)
-		blobfile = erofs_tmpfile();
-	else
-		blobfile = open(blobfile_path, O_WRONLY | O_CREAT |
-						O_TRUNC | O_BINARY, 0666);
-	if (blobfile < 0)
-		return -errno;
+	if (!blobfile_path) {
+#ifdef HAVE_TMPFILE64
+		blobfile = tmpfile64();
+#else
+		blobfile = tmpfile();
+#endif
+		multidev = false;
+	} else {
+		blobfile = fopen(blobfile_path, "wb");
+		multidev = true;
+	}
+	if (!blobfile)
+		return -EACCES;
 
 	hashmap_init(&blob_hashmap, erofs_blob_hashmap_cmp, 0);
 	return erofs_insert_zerochunk(chunksize);
+}
+
+int erofs_mkfs_init_devices(struct erofs_sb_info *sbi, unsigned int devices)
+{
+	if (!devices)
+		return 0;
+
+	sbi->devs = calloc(devices, sizeof(sbi->devs[0]));
+	if (!sbi->devs)
+		return -ENOMEM;
+
+	bh_devt = erofs_balloc(sbi->bmgr, DEVT,
+		sizeof(struct erofs_deviceslot) * devices, 0, 0);
+	if (IS_ERR(bh_devt)) {
+		free(sbi->devs);
+		return PTR_ERR(bh_devt);
+	}
+	erofs_mapbh(NULL, bh_devt->block);
+	bh_devt->op = &erofs_skip_write_bhops;
+	sbi->devt_slotoff = erofs_btell(bh_devt, false) / EROFS_DEVT_SLOT_SIZE;
+	sbi->extra_devices = devices;
+	erofs_sb_set_device_table(sbi);
+	return 0;
 }
