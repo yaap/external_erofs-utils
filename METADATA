@@ -17,6 +17,7 @@ third_party {
   identifier {
     type: "Git"
     value: "https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git"
-    version: "v1.8.3"
+    version: "ac194207e7f1796c78c5df13ab9fca4d4b088e6e"
+    closest_version: "v1.8.3"
   }
 }
